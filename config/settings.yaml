@@ -1,0 +1,74 @@
+# Default configuration for Options Trading Engine
+# These settings can be overridden by environment variables
+
+portfolio:
+  nav: 100000.0
+  capital_available: 10000.0
+  max_trades: 5
+  max_loss_per_trade: 500.0
+  min_pop: 0.65
+  min_credit_to_max_loss: 0.33
+  max_delta_multiplier: 0.30
+  min_vega_multiplier: -0.05
+  max_gamma_exposure: 1000.0
+  max_theta_exposure: -100.0
+  max_trades_per_sector: 2
+
+market_scan:
+  scan_universe: "SP500"  # Options: SP500, NASDAQ100, custom
+  custom_tickers: []
+  exclude_tickers: []
+  max_days_to_expiration: 45
+  min_days_to_expiration: 7
+  max_quote_age_minutes: 10
+  min_option_volume: 10
+  min_open_interest: 100
+  max_bid_ask_spread_pct: 0.50
+  allowed_strategies:
+    - "put_credit_spread"
+    - "call_credit_spread"
+    - "iron_condor"
+    - "covered_call"
+
+system:
+  environment: "development"
+  log_level: "INFO"
+  debug: false
+  cache_ttl_seconds: 300
+  cache_max_size: 1000
+  enable_cache: true
+  max_concurrent_requests: 10
+  request_timeout: 30
+  enable_metrics: true
+  metrics_port: 8080
+
+# API endpoint configurations
+api_endpoints:
+  tradier:
+    base_url: "https://api.tradier.com"
+    sandbox_url: "https://sandbox.tradier.com"
+    endpoints:
+      options_chains: "/v1/markets/options/chains"
+      quotes: "/v1/markets/quotes"
+      market_calendar: "/v1/markets/calendar"
+    rate_limits:
+      per_minute: 120
+      per_hour: 3600
+  
+  yahoo:
+    base_url: "https://yahoo-finance15.p.rapidapi.com"
+    endpoints:
+      stock_info: "/api/yahoo/co/collections/list"
+      financials: "/api/yahoo/fi/financials"
+      options: "/api/yahoo/op/option"
+    rate_limits:
+      per_minute: 500
+      per_month: 10000
+  
+  fred:
+    base_url: "https://api.stlouisfed.org/fred"
+    endpoints:
+      series: "/series/observations"
+      categories: "/category/series"
+    rate_limits:
+      per_minute: 120
