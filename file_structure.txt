@@ -1,0 +1,107 @@
+options_engine/
+├── src/
+│   ├── __init__.py
+│   ├── data/                    # Data layer components
+│   │   ├── __init__.py
+│   │   ├── models/              # Data models and schemas
+│   │   │   ├── __init__.py
+│   │   │   ├── options.py       # Options contract models
+│   │   │   ├── market_data.py   # Market data models
+│   │   │   ├── trades.py        # Trade and strategy models
+│   │   │   └── portfolios.py    # Portfolio models
+│   │   ├── repositories/        # Data access layer
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py          # Abstract repository
+│   │   │   ├── options_repo.py  # Options data repository
+│   │   │   └── market_repo.py   # Market data repository
+│   │   └── validators/          # Data validation
+│   │       ├── __init__.py
+│   │       ├── options_validators.py
+│   │       └── market_validators.py
+│   ├── domain/                  # Business logic and models
+│   │   ├── __init__.py
+│   │   ├── entities/           # Core business entities
+│   │   │   ├── __init__.py
+│   │   │   ├── option_contract.py
+│   │   │   ├── strategy.py
+│   │   │   └── portfolio.py
+│   │   ├── services/           # Business logic services
+│   │   │   ├── __init__.py
+│   │   │   ├── strategy_generator.py
+│   │   │   ├── risk_calculator.py
+│   │   │   └── scoring_engine.py
+│   │   └── value_objects/      # Immutable value objects
+│   │       ├── __init__.py
+│   │       ├── greeks.py
+│   │       └── trade_metrics.py
+│   ├── infrastructure/         # External service integrations
+│   │   ├── __init__.py
+│   │   ├── api/               # API clients
+│   │   │   ├── __init__.py
+│   │   │   ├── base_client.py
+│   │   │   ├── tradier_client.py
+│   │   │   ├── yahoo_client.py
+│   │   │   ├── fred_client.py
+│   │   │   └── quiver_client.py
+│   │   ├── cache/             # Caching implementation
+│   │   │   ├── __init__.py
+│   │   │   ├── base_cache.py
+│   │   │   └── memory_cache.py
+│   │   └── monitoring/        # Logging and monitoring
+│   │       ├── __init__.py
+│   │       ├── logger.py
+│   │       └── metrics.py
+│   ├── application/           # Use cases and orchestration
+│   │   ├── __init__.py
+│   │   ├── use_cases/        # Application use cases
+│   │   │   ├── __init__.py
+│   │   │   ├── scan_market.py
+│   │   │   └── generate_trades.py
+│   │   └── config/           # Configuration management
+│   │       ├── __init__.py
+│   │       ├── settings.py
+│   │       └── validators.py
+│   └── presentation/         # Output formatting and interfaces
+│       ├── __init__.py
+│       ├── formatters/       # Output formatters
+│       │   ├── __init__.py
+│       │   ├── table_formatter.py
+│       │   └── console_formatter.py
+│       └── cli/              # Command line interface
+│           ├── __init__.py
+│           └── main.py
+├── tests/
+│   ├── __init__.py
+│   ├── unit/                 # Unit tests
+│   │   ├── __init__.py
+│   │   ├── test_models/
+│   │   ├── test_services/
+│   │   └── test_api/
+│   ├── integration/          # Integration tests
+│   │   ├── __init__.py
+│   │   └── test_api_integration/
+│   └── end_to_end/          # End-to-end tests
+│       ├── __init__.py
+│       └── test_complete_workflow.py
+├── config/
+│   ├── settings.yaml         # Default configuration
+│   ├── settings.schema.json  # Configuration schema
+│   └── api_endpoints.yaml    # API endpoint configurations
+├── docs/
+│   ├── README.md
+│   ├── API.md
+│   ├── CONFIGURATION.md
+│   └── DEVELOPMENT.md
+├── scripts/
+│   ├── setup.py
+│   ├── run_tests.py
+│   └── deploy.py
+├── logs/                     # Log files
+├── .env.example             # Environment variables template
+├── .env                     # Environment variables (git ignored)
+├── .gitignore
+├── requirements.txt
+├── setup.py
+├── pytest.ini
+├── pyproject.toml           # Black, isort, mypy configuration
+└── README.md

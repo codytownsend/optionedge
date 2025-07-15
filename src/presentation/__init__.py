@@ -1,0 +1,1 @@
+"""Presentation layer - Output formatting and interfaces."""
