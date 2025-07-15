@@ -1,0 +1,160 @@
+Build a Python-based options trade discovery engine that simulates the research workflow of a quantitative options desk. This system must integrate live or near real-time financial data from low-cost and public APIs and output the 5 most favorable options trades according to well-defined quantitative selection rules. It should be modular, repeatable, and capable of supporting both broad-market scans and custom portfolio-focused scans.
+
+System Description:
+
+You are creating an automated analysis tool that evaluates U.S. equity options across multiple tickers. The system pulls real-time and near-real-time data from a combination of services, including options chain data, fundamental metrics, technical indicators, macroeconomic data, ETF flow data, and sentiment signals. The system evaluates trades based on user-defined constraints and a custom scoring model. It must output trade candidates as a plain-text table containing only trades that are executable based on current market conditions and the user’s capital availability.
+
+Core Functional Requirements:
+
+Options Data Collection
+
+Use the Tradier API to retrieve the full options chain for each ticker, including:
+
+Bid/ask prices
+
+Delta, Gamma, Theta, Vega, Rho
+
+Implied Volatility (IV)
+
+Open interest and volume by strike/expiration
+
+Expiration dates and strike ladders
+
+Include both standard and weekly expirations, and support deep out-of-the-money strikes.
+
+Fundamental & Estimate Data
+
+Use the Yahoo Finance API (via RapidAPI) or Finbox API to retrieve:
+
+EPS, revenue, net income, EBITDA
+
+P/E ratio, PEG ratio (forward), free cash flow
+
+Gross and operating margins
+
+Insider transactions and forward guidance (if available)
+
+Technical Indicators
+
+Pull OHLCV data from Alpaca API, Yahoo Finance, or another provider
+
+Compute:
+
+50/100/200-day moving averages
+
+RSI, MACD, ATR, Bollinger Bands, VWAP
+
+Historical volatility (30-day, 60-day)
+
+Price momentum over trailing 1, 5, and 20 days
+
+Macro & ETF Data
+
+Use FRED API for:
+
+CPI, GDP, unemployment, 10-year treasury yield, retail sales
+
+Use ETF.com, QuiverQuant, or scraped sources for:
+
+SPY and sector ETF flows
+
+Leveraged ETF rebalance impact
+
+Short interest, inflow/outflow patterns
+
+Sentiment and Alt Data
+
+Use QuiverQuant API or public Reddit/X data for:
+
+Social sentiment scoring by ticker
+
+Insider sentiment
+
+13F filings and institutional ownership trends
+
+Analyst upgrades/downgrades and consensus targets
+
+Trade Selection Logic:
+
+Filter candidate trades using the following hard constraints:
+
+Maximum number of trades selected: 5
+
+Quote age must be ≤ 10 minutes
+
+Top option trade must have:
+
+Probability of Profit (POP) ≥ 0.65
+
+Credit-to-max-loss ratio ≥ 0.33
+
+Maximum loss ≤ $500 (based on a portfolio NAV of $100,000)
+
+Trades must fall within user-defined capital availability (e.g., if the user has $50 to spend, each trade must require ≤ $50 of buying power or net debit)
+
+Maintain portfolio-level Greeks:
+
+Net basket delta must be within the range [-0.30, +0.30] × (NAV / 100k)
+
+Net basket vega must be ≥ -0.05 × (NAV / 100k)
+
+Sector diversification rule:
+
+No more than 2 trades may be from the same GICS sector
+
+If fewer than 5 trades meet all criteria, display: "Fewer than 5 trades meet criteria, do not execute."
+
+Trade Ranking and Output:
+
+Rank valid trades using a model_score that may combine:
+
+POP
+
+IV Rank or IV Percentile
+
+Momentum Z-score (based on normalized price momentum)
+
+Flow Z-score (based on ETF or volume inflows)
+
+In case of ties, prefer trades with higher momentum_z and flow_z
+
+Final Output Format:
+Return a plain text table with the following columns only:
+
+nginx
+Copy
+Edit
+Ticker | Strategy | Legs | Thesis | POP
+Where:
+
+Ticker is the underlying stock symbol
+
+Strategy is the high-level trade type (e.g., put credit spread, iron condor)
+
+Legs shows the strike structure and expiration
+
+Thesis is ≤ 30 words, in plain language, explaining the rationale
+
+POP is the modeled probability of profit
+
+Do not include additional commentary or explanation. Format the table with fixed-width spacing and ensure it is console-friendly (not HTML or markdown).
+
+Configuration Options:
+
+Support both full-universe scanning (e.g., top 500 optionable tickers by volume) and a user-defined watchlist (e.g., ["AAPL", "MSFT", "GOOG"])
+
+Support a user-defined NAV (net asset value) and capital_available (e.g., NAV = 100000, capital_available = 50)
+
+Allow filtering by expiration windows (e.g., only consider trades expiring within 21 days)
+
+Implementation Guidance:
+
+All major functionality (API access, filtering, ranking, table generation) should be encapsulated in modular, reusable functions or classes
+
+Provide retry and error handling for API calls
+
+Where POP or scoring is not available via API, use proxy calculations (e.g., based on delta and spread width for verticals)
+
+Assume access to common Python libraries such as requests, pandas, numpy, and scipy
+
+End goal: a repeatable, flexible, and cost-efficient quant options trade filtering system that identifies only executable, edge-positive trades based on real market conditions, constrained by capital and portfolio-level Greeks.
