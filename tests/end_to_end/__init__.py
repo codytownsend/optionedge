@@ -1,1 +1,3 @@
-"""End-to-end tests for options trading engine."""
+"""
+End-to-end tests for the Options Trading Engine.
+"""

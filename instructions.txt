@@ -1,0 +1,1924 @@
+# Options Trade Discovery Engine - Complete Development Instructions
+
+## Pre-Development Setup
+
+### 1. Environment Preparation
+- Create a new Python virtual environment using Python 3.9 or higher
+- Install required dependencies: `requests`, `pandas`, `numpy`, `scipy`, `pyyaml`, `pytest`, `black`, `isort`, `mypy`
+- Set up the exact directory structure as specified in the project documents under `options_engine/`
+- Create `.env` file with all required API keys: TRADIER_API_KEY, YAHOO_FINANCE_API_KEY, FRED_API_KEY, QUIVER_QUANT_API_KEY, ALPACA_API_KEY
+- Initialize git repository with proper `.gitignore` for Python projects
+- Configure logging framework to write to `logs/` directory with multiple severity levels
+- Set up code formatting standards using Black, isort, and mypy with configuration in `pyproject.toml`
+
+### 2. Configuration System Foundation
+- Create `config/settings.yaml` with all default parameters from project requirements
+- Implement JSON schema validation in `config/settings.schema.json` for user configuration validation
+- Build configuration loader in `src/application/config/settings.py` that validates user inputs against schema
+- Implement environment variable override system for API keys and sensitive settings
+- Create configuration validation system that ensures all required parameters are present and valid
+
+## Phase 1: Foundation & Data Infrastructure
+
+### 3. Core Data Models Implementation
+- Create base data model classes in `src/data/models/` for:
+  - `options.py`: OptionContract class with all Greeks (Delta, Gamma, Theta, Vega, Rho), bid/ask, IV, volume, open interest
+  - `market_data.py`: OHLCV data, technical indicators, fundamental metrics with timestamps
+  - `trades.py`: Strategy definitions, trade candidates with risk metrics, execution parameters
+  - `portfolios.py`: Portfolio holdings, aggregate Greeks, NAV tracking
+- Implement data validation decorators and property validators for all numeric fields
+- Add timestamp tracking and data freshness validation to all models
+- Create serialization/deserialization methods for caching and storage
+
+### 4. API Integration Architecture
+- Build abstract base class `src/infrastructure/api/base_client.py` with:
+  - Standardized request/response handling
+  - Automatic retry logic with exponential backoff (max 3 retries, 1s, 2s, 4s delays)
+  - Rate limiting respecting each provider's constraints
+  - Circuit breaker pattern for failing services (5 failures = 60s timeout)
+  - Request/response logging for debugging
+
+- Implement specific API clients with exact specifications:
+  
+  **Tradier API Client (`tradier_client.py`):**
+  - Base URL: `https://api.tradier.com/v1/`
+  - Authentication: Bearer token in header: `Authorization: Bearer {API_KEY}`
+  - Rate Limit: 120 requests/minute
+  
+  Key Endpoints:
+  ```
+  GET /markets/options/chains?symbol={SYMBOL}&expiration={DATE}
+  Response fields to extract:
+  - strike: float
+  - bid: float  
+  - ask: float
+  - last: float
+  - volume: int
+  - open_interest: int
+  - delta: float
+  - gamma: float
+  - theta: float
+  - vega: float
+  - rho: float
+  - implied_volatility: float
+  - option_type: 'call' or 'put'
+  ```
+  
+  ```
+  GET /markets/quotes?symbols={SYMBOLS}
+  Response parsing for underlying stock data:
+  - last: current price
+  - volume: daily volume
+  - change: price change
+  - change_percentage: percentage change
+  ```
+
+  **Yahoo Finance API Client (`yahoo_client.py`):**
+  - Use yfinance library or direct API calls to `https://query1.finance.yahoo.com/`
+  - No authentication required for basic data
+  - Rate Limit: ~2000 requests/hour
+  
+  Key Data Extraction:
+  ```python
+  # Fundamental data from info endpoint
+  info = ticker.info
+  Required fields:
+  - 'trailingPE': P/E ratio
+  - 'pegRatio': PEG ratio
+  - 'grossMargins': Gross margin
+  - 'operatingMargins': Operating margin
+  - 'freeCashflow': Free cash flow
+  - 'totalRevenue': Revenue
+  - 'netIncomeToCommon': Net income
+  - 'sector': GICS sector
+  ```
+  
+  **FRED API Client (`fred_client.py`):**
+  - Base URL: `https://api.stlouisfed.org/fred/series/observations`
+  - Authentication: API key parameter: `?api_key={KEY}`
+  - Rate Limit: 120 requests/minute
+  
+  Key Series IDs:
+  ```
+  - 'CPIAUCSL': Consumer Price Index
+  - 'GDP': Gross Domestic Product  
+  - 'UNRATE': Unemployment Rate
+  - 'DGS10': 10-Year Treasury Rate
+  - 'HOUST': Housing Starts
+  ```
+  
+  **Alpha Vantage/Polygon for Technical Data:**
+  - Use for OHLCV when Yahoo Finance insufficient
+  - Implement fallback hierarchy: Yahoo → Alpha Vantage → Polygon
+
+- Add data source prioritization with fallback hierarchies:
+  ```python
+  def get_options_data(symbol):
+      try:
+          return tradier_client.get_options_chain(symbol)
+      except APIError:
+          try:
+              return polygon_client.get_options_chain(symbol)  # Fallback
+          except APIError:
+              raise DataUnavailableError(f"No options data available for {symbol}")
+  ```
+
+- Implement API health monitoring:
+  - Track response times and error rates per endpoint
+  - Automatic circuit breaker activation on >50% error rate
+  - Health check endpoints every 5 minutes during market hours
+
+### 5. Caching System Implementation
+- Create memory-based caching system in `src/infrastructure/cache/`
+- Implement cache invalidation based on data freshness requirements (≤10 minutes for quotes)
+- Add cache hit/miss metrics for performance monitoring
+- Create cache warming strategies for frequently accessed data
+- Implement cache size limits and LRU eviction policies
+
+### 6. Error Handling Framework
+- Implement comprehensive exception hierarchy for different error types
+- Create graceful degradation mechanisms when non-critical APIs fail
+- Add structured logging with error categorization and severity levels
+- Implement user notification system for API outages and data quality issues
+- Create emergency shutdown procedures for critical system failures
+
+## Phase 2: Options Data Collection & Processing
+
+### 7. Options Chain Data Retrieval
+- Build comprehensive options data collector that fetches:
+  - Full options chains for all expiration cycles (standard and weekly)
+  - Real-time bid/ask prices with spread quality assessment
+  - All Greeks with mathematical validation using Black-Scholes verification
+  - Volume and open interest with trend analysis
+  - Strike ladder completeness with gap identification
+- Implement data quality filters:
+  - Reject quotes older than 10 minutes
+  - Validate bid/ask spreads (reject if spread > 50% of mid)
+  - Cross-validate Greeks calculations
+  - Verify volume/open interest consistency
+- Add options contract standardization and normalization
+
+### 8. Fundamental Data Integration
+- Create fundamental data collector for:
+  - Quarterly/annual financial statements (EPS, revenue, EBITDA)
+  - Valuation ratios (P/E, PEG, price-to-book)
+  - Profitability metrics (gross margin, operating margin, free cash flow)
+  - Forward estimates and analyst guidance
+  - Insider trading activity and institutional ownership changes
+- Implement industry-adjusted ratio calculations for peer comparisons
+- Add data normalization across different reporting standards
+- Create historical trend analysis with seasonal adjustments
+
+### 9. Technical Analysis Engine
+- Build technical indicator calculator with specific formulas:
+  
+  **Moving Averages:**
+  ```python
+  # Simple Moving Average
+  SMA_n = sum(prices[-n:]) / n
+  
+  # Exponential Moving Average  
+  EMA_today = (Price_today * (2/(n+1))) + (EMA_yesterday * (1 - (2/(n+1))))
+  
+  # Required: 50, 100, 200-day SMAs and 12, 26-day EMAs
+  ```
+  
+  **RSI (14-period default):**
+  ```python
+  # Calculate price changes
+  deltas = np.diff(prices)
+  gains = np.where(deltas > 0, deltas, 0)
+  losses = np.where(deltas < 0, -deltas, 0)
+  
+  # Average gains and losses
+  avg_gain = np.mean(gains[-14:])
+  avg_loss = np.mean(losses[-14:])
+  
+  # RSI calculation
+  rs = avg_gain / avg_loss if avg_loss != 0 else 0
+  rsi = 100 - (100 / (1 + rs))
+  ```
+  
+  **MACD:**
+  ```python
+  # MACD Line = 12-day EMA - 26-day EMA
+  macd_line = ema_12 - ema_26
+  
+  # Signal Line = 9-day EMA of MACD Line
+  signal_line = calculate_ema(macd_line, 9)
+  
+  # MACD Histogram = MACD Line - Signal Line
+  histogram = macd_line - signal_line
+  ```
+  
+  **Bollinger Bands:**
+  ```python
+  # 20-period moving average and standard deviation
+  sma_20 = np.mean(prices[-20:])
+  std_20 = np.std(prices[-20:])
+  
+  # Bands
+  upper_band = sma_20 + (2 * std_20)
+  lower_band = sma_20 - (2 * std_20)
+  
+  # %B indicator
+  percent_b = (current_price - lower_band) / (upper_band - lower_band)
+  ```
+  
+  **ATR (Average True Range):**
+  ```python
+  # True Range calculation
+  high_low = high - low
+  high_close_prev = abs(high - close_prev)
+  low_close_prev = abs(low - close_prev)
+  
+  true_range = max(high_low, high_close_prev, low_close_prev)
+  
+  # 14-period ATR
+  atr = np.mean(true_ranges[-14:])
+  ```
+  
+  **Historical Volatility:**
+  ```python
+  # Calculate log returns
+  log_returns = np.log(prices[1:] / prices[:-1])
+  
+  # Annualized volatility (252 trading days)
+  volatility = np.std(log_returns) * np.sqrt(252)
+  
+  # Calculate for 30, 60, 90-day periods
+  ```
+  
+  **VWAP (Volume Weighted Average Price):**
+  ```python
+  # Daily VWAP calculation
+  typical_price = (high + low + close) / 3
+  vwap = np.sum(typical_price * volume) / np.sum(volume)
+  ```
+
+- Implement momentum scoring:
+  ```python
+  # Price momentum calculation
+  momentum_1d = (current_price / prev_1d_price) - 1
+  momentum_5d = (current_price / prev_5d_price) - 1  
+  momentum_20d = (current_price / prev_20d_price) - 1
+  
+  # Momentum Z-score (standardized over 252-day lookback)
+  momentum_mean = np.mean(momentum_20d_history)
+  momentum_std = np.std(momentum_20d_history)
+  momentum_z = (current_momentum_20d - momentum_mean) / momentum_std
+  ```
+
+- Add volatility regime classification:
+  ```python
+  # Calculate realized volatility percentile
+  current_rv = calculate_realized_volatility(prices, 30)
+  historical_rv = [calculate_realized_volatility(prices[i:i+30]) for i in range(len(prices)-252, len(prices)-30)]
+  
+  rv_percentile = percentileofscore(historical_rv, current_rv)
+  
+  # Regime classification
+  if rv_percentile > 80:
+      regime = "HIGH_VOLATILITY"
+  elif rv_percentile < 20:
+      regime = "LOW_VOLATILITY"  
+  else:
+      regime = "NORMAL_VOLATILITY"
+  ```
+
+### 10. Macro and ETF Data Collection
+- Build FRED API integration for macroeconomic indicators:
+  - CPI, GDP, unemployment rate, treasury yields
+  - Retail sales, consumer sentiment, inflation expectations
+- Implement ETF flow data collection:
+  - SPY and sector ETF inflow/outflow patterns
+  - Leveraged ETF rebalancing impact analysis
+  - Short interest and institutional positioning data
+- Add economic event calendar integration
+- Create macro regime classification system
+
+### 11. Sentiment and Alternative Data
+- Integrate sentiment data sources:
+  - Social media sentiment scoring by ticker
+  - Analyst upgrades/downgrades with consensus tracking
+  - 13F filings and institutional ownership trends
+  - News sentiment analysis with event impact scoring
+- Implement sentiment signal validation and noise filtering
+- Add insider sentiment tracking and corporate guidance analysis
+- Create alternative data quality scoring and weighting system
+
+## Phase 3: Strategy Generation & Greeks Management
+
+### 12. Options Strategy Generation Engine
+- Build strategy generators with specific construction algorithms:
+  
+  **Credit Spread Construction:**
+  ```python
+  def generate_put_credit_spreads(options_chain, target_dte=21):
+      """Generate put credit spreads"""
+      put_options = filter_puts(options_chain, dte=target_dte)
+      
+      for short_strike in put_options:
+          # Short strike selection criteria
+          if short_strike.delta < -0.15 or short_strike.delta > -0.35:
+              continue  # Target delta range for short leg
+              
+          # Find long strike (lower strike for puts)
+          long_strikes = [opt for opt in put_options 
+                         if opt.strike < short_strike.strike 
+                         and (short_strike.strike - opt.strike) in [5, 10, 15, 20]]
+          
+          for long_strike in long_strikes:
+              # Calculate spread metrics
+              net_credit = short_strike.bid - long_strike.ask
+              max_loss = (short_strike.strike - long_strike.strike) - net_credit
+              
+              # Filtering criteria
+              if net_credit < 0.05:  # Minimum credit
+                  continue
+              if max_loss > MAX_LOSS_PER_TRADE:
+                  continue
+                  
+              # Credit-to-max-loss ratio check
+              credit_ratio = net_credit / max_loss
+              if credit_ratio < 0.33:
+                  continue
+                  
+              # Calculate POP (approximation using short delta)
+              pop = 1 + short_strike.delta  # For puts, delta is negative
+              
+              if pop >= 0.65:
+                  yield create_spread_strategy("PUT_CREDIT_SPREAD", 
+                                             short_strike, long_strike, 
+                                             net_credit, max_loss, pop)
+  ```
+  
+  **Iron Condor Construction:**
+  ```python
+  def generate_iron_condors(options_chain, target_dte=21):
+      """Generate iron condor strategies"""
+      puts = filter_puts(options_chain, dte=target_dte)
+      calls = filter_calls(options_chain, dte=target_dte)
+      
+      # Target delta ranges for short legs
+      short_puts = [p for p in puts if -0.25 <= p.delta <= -0.15]
+      short_calls = [c for c in calls if 0.15 <= c.delta <= 0.25]
+      
+      for short_put in short_puts:
+          for short_call in short_calls:
+              # Ensure strikes are properly spaced
+              strike_width = short_call.strike - short_put.strike
+              if strike_width < 20:  # Minimum width between short strikes
+                  continue
+                  
+              # Find wing options (same distance from short strikes)
+              wing_width = 10  # Standard wing width
+              
+              long_put = find_option(puts, short_put.strike - wing_width)
+              long_call = find_option(calls, short_call.strike + wing_width)
+              
+              if not (long_put and long_call):
+                  continue
+                  
+              # Calculate net credit and max loss
+              net_credit = (short_put.bid + short_call.bid - 
+                           long_put.ask - long_call.ask)
+              max_loss = wing_width - net_credit
+              
+              if net_credit <= 0 or max_loss > MAX_LOSS_PER_TRADE:
+                  continue
+                  
+              # Credit-to-max-loss ratio
+              if (net_credit / max_loss) < 0.33:
+                  continue
+                  
+              # POP calculation (probability of staying between short strikes)
+              pop = calculate_iron_condor_pop(short_put.strike, 
+                                            short_call.strike, 
+                                            current_price, volatility, dte)
+              
+              if pop >= 0.65:
+                  yield create_iron_condor(short_put, long_put, 
+                                         short_call, long_call,
+                                         net_credit, max_loss, pop)
+  ```
+  
+  **Covered Call Strategy:**
+  ```python
+  def generate_covered_calls(stock_price, call_options, target_dte=30):
+      """Generate covered call strategies (assumes stock ownership)"""
+      calls = filter_calls(call_options, dte=target_dte)
+      
+      for call in calls:
+          # Target strikes at or above current price
+          if call.strike < stock_price:
+              continue
+              
+          # Delta range for covered calls (typically 0.10 - 0.30)
+          if call.delta < 0.10 or call.delta > 0.30:
+              continue
+              
+          # Calculate returns
+          premium_income = call.bid
+          max_profit = (call.strike - stock_price) + premium_income
+          
+          # Annualized return calculation
+          days_to_exp = call.days_to_expiration
+          annualized_return = (max_profit / stock_price) * (365 / days_to_exp)
+          
+          # Minimum return threshold
+          if annualized_return < 0.12:  # 12% minimum annualized
+              continue
+              
+          # Assignment probability (POP for covered calls)
+          pop = call.delta  # Probability of finishing ITM
+          
+          yield create_covered_call(call, premium_income, 
+                                  max_profit, annualized_return, pop)
+  ```
+  
+  **Strike Selection Algorithm:**
+  ```python
+  def optimize_strike_selection(options_chain, strategy_type):
+      """Optimize strike selection based on risk/reward and liquidity"""
+      
+      # Liquidity filters
+      min_open_interest = 50
+      max_bid_ask_spread_pct = 0.05  # 5% of mid price
+      
+      for option in options_chain:
+          # Liquidity checks
+          if option.open_interest < min_open_interest:
+              continue
+              
+          mid_price = (option.bid + option.ask) / 2
+          spread_pct = (option.ask - option.bid) / mid_price if mid_price > 0 else 1
+          
+          if spread_pct > max_bid_ask_spread_pct:
+              continue
+              
+          # Strategy-specific delta targets
+          if strategy_type == "PUT_CREDIT_SPREAD":
+              target_delta_range = (-0.35, -0.15)  # Short put delta
+          elif strategy_type == "CALL_CREDIT_SPREAD":
+              target_delta_range = (0.15, 0.35)    # Short call delta
+          elif strategy_type == "IRON_CONDOR":
+              target_delta_range = (-0.25, 0.25)   # Both short legs
+              
+          if not (target_delta_range[0] <= option.delta <= target_delta_range[1]):
+              continue
+              
+          yield option
+  ```
+  
+  **Position Sizing Calculation:**
+  ```python
+  def calculate_position_size(strategy, available_capital, nav):
+      """Calculate optimal position size using Kelly Criterion"""
+      
+      # Basic Kelly Criterion: f = (bp - q) / b
+      # f = fraction of capital to bet
+      # b = odds (profit/loss ratio)  
+      # p = probability of profit
+      # q = 1 - p
+      
+      pop = strategy.probability_of_profit
+      max_loss = strategy.max_loss
+      max_profit = strategy.max_profit
+      
+      # Kelly fraction calculation
+      b = max_profit / max_loss  # Profit/loss ratio
+      kelly_fraction = (pop * (1 + b) - 1) / b
+      
+      # Conservative sizing (use 1/4 of Kelly for risk management)
+      conservative_fraction = min(0.25 * kelly_fraction, 0.02)  # Max 2% of NAV
+      
+      # Calculate number of contracts
+      max_contracts_by_capital = available_capital // max_loss
+      max_contracts_by_sizing = int((nav * conservative_fraction) // max_loss)
+      
+      position_size = min(max_contracts_by_capital, max_contracts_by_sizing, 10)  # Max 10 contracts
+      
+      return max(1, position_size)  # Minimum 1 contract
+  ```
+
+### 13. Probability of Profit Calculations
+- Implement specific POP calculation methods for each strategy type:
+  
+  **Credit Spreads (Put/Call):**
+  - POP = Delta of short option (for small spreads)
+  - Alternative: POP = 1 - ((Strike_spread_width - Credit_received) / Strike_spread_width)
+  - Use Black-Scholes CDF: POP = N(d2) where d2 = (ln(S/K) + (r - 0.5*σ²)*T) / (σ*√T)
+  
+  **Iron Condors:**
+  - POP = 1 - (Put_spread_width + Call_spread_width - Net_credit) / (Put_spread_width + Call_spread_width)
+  - Alternative: POP = Probability stock stays between short strikes = N(d2_call) - N(d2_put)
+  
+  **Covered Calls:**
+  - POP = N(d2) where K = strike price, using standard Black-Scholes d2 calculation
+  
+  **Cash-Secured Puts:**
+  - POP = N(d2) where d2 calculated for put option
+  
+- Add early assignment probability for American options:
+  - Check if (Intrinsic_value + Dividend) > Time_value
+  - Assignment_probability = max(0, (Intrinsic - Time_value) / Intrinsic)
+  
+- Implement Monte Carlo simulation (10,000 iterations minimum):
+  - Generate price paths using GBM: S(t) = S(0) * exp((r - 0.5*σ²)*t + σ*√t*Z)
+  - Calculate P&L for each path at expiration
+  - POP = percentage of profitable outcomes
+
+### 14. Risk Metrics and Greeks Calculations
+- Implement Black-Scholes Greeks formulas:
+  
+  **Delta:**
+  - Call Delta = N(d1)
+  - Put Delta = -N(-d1) = N(d1) - 1
+  - Where d1 = (ln(S/K) + (r + 0.5*σ²)*T) / (σ*√T)
+  
+  **Gamma:**
+  - Gamma = φ(d1) / (S * σ * √T)
+  - Where φ(x) = (1/√(2π)) * exp(-x²/2)
+  
+  **Theta:**
+  - Call Theta = (-S * φ(d1) * σ / (2√T) - r * K * exp(-r*T) * N(d2)) / 365
+  - Put Theta = (-S * φ(d1) * σ / (2√T) + r * K * exp(-r*T) * N(-d2)) / 365
+  
+  **Vega:**
+  - Vega = S * φ(d1) * √T / 100
+  
+  **Rho:**
+  - Call Rho = K * T * exp(-r*T) * N(d2) / 100
+  - Put Rho = -K * T * exp(-r*T) * N(-d2) / 100
+  
+  Where:
+  - S = Current stock price
+  - K = Strike price
+  - T = Time to expiration (in years)
+  - r = Risk-free rate
+  - σ = Implied volatility
+  - N(x) = Cumulative standard normal distribution
+  - φ(x) = Standard normal probability density function
+
+- Build portfolio Greeks aggregation:
+  - Portfolio_Delta = Σ(Delta_i * Position_size_i * Multiplier_i)
+  - Portfolio_Gamma = Σ(Gamma_i * Position_size_i * Multiplier_i)
+  - Portfolio_Theta = Σ(Theta_i * Position_size_i * Multiplier_i)
+  - Portfolio_Vega = Σ(Vega_i * Position_size_i * Multiplier_i)
+  - Where Multiplier = 100 for standard contracts
+
+- Calculate strategy-specific risk metrics:
+  
+  **Maximum Loss Calculations:**
+  - Credit Spreads: Max_loss = Strike_spread_width - Net_credit_received
+  - Iron Condors: Max_loss = max(Put_spread_width, Call_spread_width) - Net_credit
+  - Covered Calls: Max_loss = Stock_cost - Strike_price - Premium_received (if stock below strike)
+  
+  **Breakeven Calculations:**
+  - Credit Spreads: Breakeven = Short_strike ± Net_credit
+  - Iron Condors: Upper_BE = Call_short_strike + Net_credit, Lower_BE = Put_short_strike - Net_credit
+
+### 15. Strategy Optimization Framework
+- Create position sizing optimizer using modern portfolio theory
+- Implement risk budget allocation across strategy types
+- Add correlation analysis for position interaction effects
+- Build stress testing capabilities for portfolio scenarios
+- Create dynamic hedging recommendations
+
+## Phase 4: Filtering & Constraint Engine
+
+### 16. Hard Constraint Implementation
+- Build constraint filters with specific algorithms:
+  
+  **Quote Freshness Validation:**
+  ```python
+  def validate_quote_freshness(quote_timestamp, max_age_minutes=10):
+      """Reject quotes older than 10 minutes"""
+      current_time = datetime.now(timezone.utc)
+      quote_time = datetime.fromisoformat(quote_timestamp)
+      
+      age_minutes = (current_time - quote_time).total_seconds() / 60
+      return age_minutes <= max_age_minutes
+  ```
+  
+  **Probability of Profit Filter:**
+  ```python
+  def validate_pop_constraint(strategy):
+      """Ensure POP >= 0.65"""
+      return strategy.probability_of_profit >= 0.65
+  ```
+  
+  **Credit-to-Max-Loss Ratio:**
+  ```python
+  def validate_credit_ratio(strategy):
+      """Ensure credit-to-max-loss ratio >= 0.33"""
+      if strategy.max_loss <= 0:
+          return False
+      ratio = strategy.net_credit / strategy.max_loss
+      return ratio >= 0.33
+  ```
+  
+  **Maximum Loss Per Trade:**
+  ```python
+  def validate_max_loss(strategy, nav):
+      """Ensure max loss <= $500 or 0.5% of NAV, whichever is lower"""
+      max_allowed_loss = min(500, nav * 0.005)
+      return strategy.max_loss <= max_allowed_loss
+  ```
+  
+  **Capital Availability Check:**
+  ```python
+  def validate_capital_requirement(strategy, available_capital):
+      """Check if strategy fits within available capital"""
+      # For credit strategies, required capital = max loss
+      # For debit strategies, required capital = net debit paid
+      
+      if strategy.strategy_type in ["PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD", "IRON_CONDOR"]:
+          required_capital = strategy.max_loss
+      else:  # Debit strategies
+          required_capital = strategy.net_debit
+          
+      return required_capital <= available_capital
+  ```
+  
+  **Liquidity Validation:**
+  ```python
+  def validate_liquidity(option_legs):
+      """Check minimum liquidity requirements"""
+      for leg in option_legs:
+          # Minimum open interest
+          if leg.open_interest < 50:
+              return False
+              
+          # Maximum bid-ask spread (5% of mid price)
+          mid_price = (leg.bid + leg.ask) / 2
+          if mid_price <= 0:
+              return False
+              
+          spread_pct = (leg.ask - leg.bid) / mid_price
+          if spread_pct > 0.05:
+              return False
+              
+          # Minimum daily volume
+          if leg.volume < 10:
+              return False
+              
+      return True
+  ```
+
+### 17. Portfolio-Level Risk Controls
+- Implement Greeks-based portfolio constraints with specific algorithms:
+  
+  **Portfolio Greeks Calculation:**
+  ```python
+  def calculate_portfolio_greeks(existing_trades, new_trade, nav):
+      """Calculate aggregate portfolio Greeks including new trade"""
+      
+      total_delta = 0
+      total_gamma = 0  
+      total_theta = 0
+      total_vega = 0
+      
+      # Sum existing positions
+      for trade in existing_trades:
+          for leg in trade.legs:
+              multiplier = 100  # Options multiplier
+              position_sign = 1 if leg.action == "BUY" else -1
+              
+              total_delta += leg.delta * leg.quantity * multiplier * position_sign
+              total_gamma += leg.gamma * leg.quantity * multiplier * position_sign
+              total_theta += leg.theta * leg.quantity * multiplier * position_sign
+              total_vega += leg.vega * leg.quantity * multiplier * position_sign
+      
+      # Add new trade Greeks
+      for leg in new_trade.legs:
+          multiplier = 100
+          position_sign = 1 if leg.action == "BUY" else -1
+          
+          total_delta += leg.delta * leg.quantity * multiplier * position_sign
+          total_gamma += leg.gamma * leg.quantity * multiplier * position_sign
+          total_theta += leg.theta * leg.quantity * multiplier * position_sign
+          total_vega += leg.vega * leg.quantity * multiplier * position_sign
+      
+      # Normalize by NAV
+      nav_factor = nav / 100000  # Reference NAV of $100k
+      
+      return {
+          'delta': total_delta / nav_factor,
+          'gamma': total_gamma / nav_factor,
+          'theta': total_theta / nav_factor,
+          'vega': total_vega / nav_factor
+      }
+  ```
+  
+  **Greeks Constraint Validation:**
+  ```python
+  def validate_portfolio_greeks(portfolio_greeks, nav):
+      """Validate portfolio Greeks against limits"""
+      nav_factor = nav / 100000
+      
+      # Delta limits: [-0.30, +0.30] × (NAV / 100k)
+      max_delta = 0.30 * nav_factor
+      if not (-max_delta <= portfolio_greeks['delta'] <= max_delta):
+          return False, f"Delta limit exceeded: {portfolio_greeks['delta']:.2f}"
+      
+      # Vega limit: >= -0.05 × (NAV / 100k)  
+      min_vega = -0.05 * nav_factor
+      if portfolio_greeks['vega'] < min_vega:
+          return False, f"Vega limit exceeded: {portfolio_greeks['vega']:.2f}"
+      
+      return True, "Greeks within limits"
+  ```
+  
+  **Sector Diversification Implementation:**
+  ```python
+  # GICS Sector Classification Mapping
+  GICS_SECTORS = {
+      "AAPL": "Information Technology",
+      "MSFT": "Information Technology", 
+      "GOOGL": "Communication Services",
+      "TSLA": "Consumer Discretionary",
+      "JPM": "Financials",
+      "JNJ": "Health Care",
+      "XOM": "Energy",
+      "PG": "Consumer Staples",
+      "UNH": "Health Care",
+      "V": "Information Technology"
+      # Add complete mapping for all tickers
+  }
+  
+  def validate_sector_diversification(existing_trades, new_trade):
+      """Ensure max 2 trades per GICS sector"""
+      
+      # Count trades by sector
+      sector_count = {}
+      
+      for trade in existing_trades:
+          sector = GICS_SECTORS.get(trade.ticker, "Unknown")
+          sector_count[sector] = sector_count.get(sector, 0) + 1
+      
+      # Check new trade sector
+      new_trade_sector = GICS_SECTORS.get(new_trade.ticker, "Unknown")
+      current_count = sector_count.get(new_trade_sector, 0)
+      
+      if current_count >= 2:
+          return False, f"Sector limit exceeded for {new_trade_sector}"
+      
+      return True, "Sector diversification maintained"
+  ```
+  
+  **Margin Requirement Calculation:**
+  ```python
+  def calculate_margin_requirement(strategy):
+      """Calculate margin/capital requirement for strategy"""
+      
+      if strategy.strategy_type == "PUT_CREDIT_SPREAD":
+          # Margin = Strike width - Net credit
+          return strategy.strike_width - strategy.net_credit
+          
+      elif strategy.strategy_type == "CALL_CREDIT_SPREAD":
+          return strategy.strike_width - strategy.net_credit
+          
+      elif strategy.strategy_type == "IRON_CONDOR":
+          # Margin = Larger of the two spread widths - Net credit
+          put_margin = strategy.put_strike_width - strategy.net_credit
+          call_margin = strategy.call_strike_width - strategy.net_credit
+          return max(put_margin, call_margin)
+          
+      elif strategy.strategy_type == "COVERED_CALL":
+          return 0  # Assuming stock already owned
+          
+      elif strategy.strategy_type == "CASH_SECURED_PUT":
+          return strategy.strike_price  # Cash secured amount
+          
+      else:
+          return strategy.max_loss  # Conservative default
+  ```
+
+### 18. Dynamic Constraint Adjustment
+- Build market regime detection system:
+  - Volatility regime classification with parameter adjustments
+  - Market stress indicators with tightened controls
+  - Liquidity condition monitoring
+  - Economic event proximity analysis
+- Implement adaptive constraint system that modifies parameters based on market conditions
+- Add earnings announcement proximity filters
+- Create emergency risk reduction protocols
+
+### 19. Capital Allocation Framework
+- Implement intelligent position sizing:
+  - Kelly criterion application for optimal sizing
+  - Risk parity across different strategy types
+  - Available margin calculation and optimization
+  - Liquidity requirements for entry/exit
+- Add stress testing for capital adequacy
+- Create position scaling based on conviction levels
+
+## Phase 5: Scoring & Ranking Engine
+
+### 20. Multi-Factor Scoring Model
+- Build composite scoring system with specific weights and calculations:
+  
+  **Primary Scoring Formula:**
+  ```python
+  def calculate_model_score(trade_data):
+      """Calculate composite model score (0-100 scale)"""
+      
+      # Component scores (each normalized to 0-100)
+      pop_score = normalize_pop_score(trade_data.probability_of_profit)
+      iv_rank_score = calculate_iv_rank_score(trade_data)
+      momentum_score = normalize_momentum_score(trade_data.momentum_z)
+      flow_score = normalize_flow_score(trade_data.flow_z)
+      risk_reward_score = calculate_risk_reward_score(trade_data)
+      liquidity_score = calculate_liquidity_score(trade_data)
+      
+      # Base weights for different market conditions
+      weights = {
+          'pop': 0.25,           # Probability of profit weight
+          'iv_rank': 0.20,       # IV rank weight  
+          'momentum': 0.20,      # Momentum weight
+          'flow': 0.15,          # Flow weight
+          'risk_reward': 0.15,   # Risk/reward weight
+          'liquidity': 0.05      # Liquidity weight
+      }
+      
+      # Adjust weights based on market regime
+      weights = adjust_weights_for_regime(weights, get_market_regime())
+      
+      model_score = (
+          pop_score * weights['pop'] +
+          iv_rank_score * weights['iv_rank'] +
+          momentum_score * weights['momentum'] +
+          flow_score * weights['flow'] +
+          risk_reward_score * weights['risk_reward'] +
+          liquidity_score * weights['liquidity']
+      )
+      
+      return round(model_score, 2)
+  ```
+  
+  **Component Score Calculations:**
+  ```python
+  def normalize_pop_score(pop):
+      """Convert POP to 0-100 score"""
+      # Linear scaling from minimum viable POP (0.65) to perfect (1.0)
+      if pop < 0.65:
+          return 0
+      return ((pop - 0.65) / 0.35) * 100
+  
+  def calculate_iv_rank_score(trade_data):
+      """IV Rank score based on current IV vs historical range"""
+      iv_current = trade_data.implied_volatility
+      iv_history = trade_data.iv_history_252d  # 1-year lookback
+      
+      if len(iv_history) < 50:
+          return 50  # Neutral score if insufficient history
+          
+      iv_rank = percentileofscore(iv_history, iv_current)
+      
+      # High IV rank is good for credit strategies (selling premium)
+      if trade_data.strategy_type in ["PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD", "IRON_CONDOR"]:
+          return iv_rank
+      else:  # Low IV rank better for debit strategies
+          return 100 - iv_rank
+  
+  def normalize_momentum_score(momentum_z):
+      """Convert momentum Z-score to 0-100 score"""
+      # Z-scores typically range -3 to +3, normalize to 0-100
+      # Positive momentum generally favored
+      normalized = 50 + (momentum_z * 16.67)  # 16.67 = 50/3
+      return max(0, min(100, normalized))
+  
+  def normalize_flow_score(flow_z):
+      """Convert flow Z-score to 0-100 score"""  
+      # Similar to momentum, positive flow favored
+      normalized = 50 + (flow_z * 16.67)
+      return max(0, min(100, normalized))
+  
+  def calculate_risk_reward_score(trade_data):
+      """Risk/reward ratio score"""
+      if trade_data.max_loss <= 0:
+          return 0
+          
+      # For credit strategies, higher credit relative to max loss is better
+      if hasattr(trade_data, 'net_credit'):
+          ratio = trade_data.net_credit / trade_data.max_loss
+          # Scale ratio (0.33 minimum to 1.0 maximum) to 0-100
+          score = ((ratio - 0.33) / 0.67) * 100
+      else:
+          # For other strategies, use profit potential
+          ratio = trade_data.max_profit / trade_data.max_loss
+          score = min(ratio * 25, 100)  # Cap at 100
+          
+      return max(0, min(100, score))
+  
+  def calculate_liquidity_score(trade_data):
+      """Liquidity quality score"""
+      score = 0
+      
+      for leg in trade_data.legs:
+          # Open interest component (0-40 points)
+          oi_score = min(leg.open_interest / 1000 * 40, 40)
+          
+          # Bid-ask spread component (0-40 points)
+          mid_price = (leg.bid + leg.ask) / 2
+          spread_pct = (leg.ask - leg.bid) / mid_price if mid_price > 0 else 1
+          spread_score = max(0, 40 * (1 - spread_pct * 20))  # Penalize wide spreads
+          
+          # Volume component (0-20 points)
+          volume_score = min(leg.volume / 100 * 20, 20)
+          
+          leg_score = oi_score + spread_score + volume_score
+          score += leg_score
+      
+      # Average across legs
+      return score / len(trade_data.legs)
+  ```
+  
+  **Market Regime Weight Adjustments:**
+  ```python
+  def adjust_weights_for_regime(base_weights, market_regime):
+      """Adjust scoring weights based on market conditions"""
+      
+      if market_regime == "HIGH_VOLATILITY":
+          # Emphasize IV rank and reduce momentum weight
+          base_weights['iv_rank'] *= 1.3
+          base_weights['momentum'] *= 0.7
+          
+      elif market_regime == "LOW_VOLATILITY":
+          # Emphasize momentum and flow, reduce IV rank
+          base_weights['momentum'] *= 1.3
+          base_weights['flow'] *= 1.2
+          base_weights['iv_rank'] *= 0.8
+          
+      elif market_regime == "TRENDING_UP":
+          # Emphasize momentum for uptrend
+          base_weights['momentum'] *= 1.4
+          base_weights['pop'] *= 0.9
+          
+      elif market_regime == "TRENDING_DOWN":
+          # Emphasize POP and reduce momentum
+          base_weights['pop'] *= 1.3
+          base_weights['momentum'] *= 0.7
+      
+      # Renormalize weights to sum to 1.0
+      total_weight = sum(base_weights.values())
+      return {k: v/total_weight for k, v in base_weights.items()}
+  ```
+
+### 21. Dynamic Weight Allocation
+- Create market regime-based weighting system:
+  - Bull market emphasis on momentum and growth
+  - Bear market focus on defensive strategies
+  - Sideways market prioritization of theta generation
+  - High volatility emphasis on vol arbitrage
+  - Low volatility focus on vol selling
+- Implement adaptive model parameters:
+  - Historical performance backtesting
+  - Rolling window optimization
+  - Cross-validation to prevent overfitting
+  - Performance attribution analysis
+
+### 22. Momentum and Flow Scoring
+- Build specific Z-score calculators:
+  
+  **Momentum Z-Score Calculation:**
+  ```python
+  def calculate_momentum_z_score(ticker, price_data):
+      """Calculate standardized momentum score"""
+      
+      # Get current and historical prices
+      current_price = price_data[-1]
+      prices_20d_ago = price_data[-21:-1]  # Previous 20 days
+      
+      # Calculate 20-day momentum
+      momentum_20d = (current_price / price_data[-21]) - 1
+      
+      # Historical momentum data (252 trading days = 1 year)
+      historical_momentum = []
+      for i in range(252, len(price_data)):
+          hist_momentum = (price_data[i] / price_data[i-20]) - 1
+          historical_momentum.append(hist_momentum)
+      
+      if len(historical_momentum) < 50:  # Need sufficient history
+          return 0.0
+      
+      # Calculate Z-score
+      mean_momentum = np.mean(historical_momentum)
+      std_momentum = np.std(historical_momentum)
+      
+      if std_momentum == 0:
+          return 0.0
+          
+      momentum_z = (momentum_20d - mean_momentum) / std_momentum
+      
+      # Cap extreme values
+      return max(-3.0, min(3.0, momentum_z))
+  ```
+  
+  **Flow Z-Score Calculation:**
+  ```python
+  def calculate_flow_z_score(ticker, etf_flow_data, options_flow_data):
+      """Calculate flow Z-score from ETF and options flow"""
+      
+      # Get sector ETF for the ticker
+      sector_etf = get_sector_etf(ticker)
+      
+      # ETF flow component
+      etf_flows = etf_flow_data.get(sector_etf, [])
+      if len(etf_flows) >= 20:
+          current_flow = etf_flows[-1]  # Most recent flow
+          historical_flows = etf_flows[-252:]  # 1-year history
+          
+          flow_mean = np.mean(historical_flows)
+          flow_std = np.std(historical_flows)
+          
+          etf_flow_z = (current_flow - flow_mean) / flow_std if flow_std > 0 else 0
+      else:
+          etf_flow_z = 0
+      
+      # Options flow component (put/call ratio, unusual volume)
+      options_flows = options_flow_data.get(ticker, {})
+      put_call_ratio = options_flows.get('put_call_ratio', 1.0)
+      volume_ratio = options_flows.get('volume_vs_oi_ratio', 1.0)
+      
+      # Convert put/call ratio to flow signal (low P/C = bullish flow)
+      pc_signal = -np.log(put_call_ratio)  # Negative log for inverse relationship
+      
+      # Volume vs OI ratio signal (high ratio = new interest)
+      volume_signal = np.log(volume_ratio)
+      
+      # Combine flow signals (weight ETF flow more heavily)
+      combined_flow_z = (0.6 * etf_flow_z + 0.25 * pc_signal + 0.15 * volume_signal)
+      
+      # Cap extreme values
+      return max(-3.0, min(3.0, combined_flow_z))
+  
+  def get_sector_etf(ticker):
+      """Map ticker to corresponding sector ETF"""
+      SECTOR_ETF_MAP = {
+          "Information Technology": "XLK",
+          "Health Care": "XLV", 
+          "Financials": "XLF",
+          "Consumer Discretionary": "XLY",
+          "Communication Services": "XLC",
+          "Industrials": "XLI",
+          "Consumer Staples": "XLP",
+          "Energy": "XLE",
+          "Utilities": "XLU",
+          "Real Estate": "XLRE",
+          "Materials": "XLB"
+      }
+      
+      sector = GICS_SECTORS.get(ticker, "Unknown")
+      return SECTOR_ETF_MAP.get(sector, "SPY")  # Default to SPY
+  ```
+
+### 23. Ranking and Selection Algorithm
+- Create hierarchical ranking system with specific tie-breaking rules:
+  
+  **Final Trade Selection Logic:**
+  ```python
+  def select_final_trades(candidate_trades, max_trades=5):
+      """Select top 5 trades using hierarchical ranking"""
+      
+      # Filter trades that pass all hard constraints
+      valid_trades = []
+      for trade in candidate_trades:
+          if validate_all_constraints(trade):
+              valid_trades.append(trade)
+      
+      # Check if we have enough valid trades
+      if len(valid_trades) < 5:
+          return {
+              'trades': valid_trades,
+              'message': "Fewer than 5 trades meet criteria, do not execute."
+          }
+      
+      # Sort by ranking hierarchy
+      def ranking_key(trade):
+          return (
+              -trade.model_score,        # Primary: highest model score (negative for desc)
+              -trade.momentum_z,         # Secondary: highest momentum Z-score
+              -trade.flow_z,             # Tertiary: highest flow Z-score
+              -trade.probability_of_profit,  # Final: highest POP
+              trade.ticker               # Alphabetical for true ties
+          )
+      
+      sorted_trades = sorted(valid_trades, key=ranking_key)
+      
+      # Select top 5 ensuring portfolio constraints
+      selected_trades = []
+      portfolio_greeks = {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0}
+      sector_count = {}
+      
+      for trade in sorted_trades:
+          # Check sector diversification
+          sector = GICS_SECTORS.get(trade.ticker, "Unknown")
+          if sector_count.get(sector, 0) >= 2:
+              continue  # Skip if sector limit reached
+          
+          # Check portfolio Greeks after adding this trade
+          new_greeks = calculate_portfolio_greeks(selected_trades, trade, NAV)
+          greeks_valid, _ = validate_portfolio_greeks(new_greeks, NAV)
+          
+          if greeks_valid:
+              selected_trades.append(trade)
+              portfolio_greeks = new_greeks
+              sector_count[sector] = sector_count.get(sector, 0) + 1
+              
+              if len(selected_trades) >= max_trades:
+                  break
+      
+      return {
+          'trades': selected_trades,
+          'message': None if len(selected_trades) >= 5 else "Fewer than 5 trades meet criteria, do not execute."
+      }
+  ```
+  
+  **Constraint Validation Master Function:**
+  ```python
+  def validate_all_constraints(trade):
+      """Master validation function for all hard constraints"""
+      
+      # Quote freshness
+      if not validate_quote_freshness(trade.quote_timestamp):
+          return False
+      
+      # Probability of profit
+      if not validate_pop_constraint(trade):
+          return False
+      
+      # Credit-to-max-loss ratio
+      if not validate_credit_ratio(trade):
+          return False
+      
+      # Maximum loss per trade
+      if not validate_max_loss(trade, NAV):
+          return False
+      
+      # Capital availability
+      if not validate_capital_requirement(trade, AVAILABLE_CAPITAL):
+          return False
+      
+      # Liquidity requirements
+      if not validate_liquidity(trade.legs):
+          return False
+      
+      return True
+  ```
+
+## Phase 6: Output Generation & Validation
+
+### 24. Trade Recommendation Formatter
+- Build fixed-width table formatter with exact specifications:
+  
+  **Console Table Format:**
+  ```python
+  def format_trades_table(selected_trades):
+      """Format trades in exact console-friendly table format"""
+      
+      if not selected_trades:
+          return "Fewer than 5 trades meet criteria, do not execute."
+      
+      # Define exact column widths for console display
+      COLUMN_WIDTHS = {
+          'ticker': 8,
+          'strategy': 20, 
+          'legs': 30,
+          'thesis': 35,
+          'pop': 6
+      }
+      
+      # Table header
+      header = (
+          f"{'Ticker':<{COLUMN_WIDTHS['ticker']}} | "
+          f"{'Strategy':<{COLUMN_WIDTHS['strategy']}} | "
+          f"{'Legs':<{COLUMN_WIDTHS['legs']}} | "
+          f"{'Thesis':<{COLUMN_WIDTHS['thesis']}} | "
+          f"{'POP':<{COLUMN_WIDTHS['pop']}}"
+      )
+      
+      # Separator line
+      separator = '-' * len(header)
+      
+      # Format each trade row
+      rows = []
+      for trade in selected_trades:
+          ticker = trade.ticker[:COLUMN_WIDTHS['ticker']]
+          strategy = format_strategy_name(trade)[:COLUMN_WIDTHS['strategy']]
+          legs = format_legs_description(trade)[:COLUMN_WIDTHS['legs']]
+          thesis = generate_thesis(trade)[:COLUMN_WIDTHS['thesis']]
+          pop = f"{trade.probability_of_profit:.2f}"
+          
+          row = (
+              f"{ticker:<{COLUMN_WIDTHS['ticker']}} | "
+              f"{strategy:<{COLUMN_WIDTHS['strategy']}} | "
+              f"{legs:<{COLUMN_WIDTHS['legs']}} | "
+              f"{thesis:<{COLUMN_WIDTHS['thesis']}} | "
+              f"{pop:<{COLUMN_WIDTHS['pop']}}"
+          )
+          rows.append(row)
+      
+      # Combine all parts
+      table = '\n'.join([header, separator] + rows)
+      return table
+  ```
+  
+  **Strategy Name Formatting:**
+  ```python
+  def format_strategy_name(trade):
+      """Standardize strategy names for display"""
+      
+      STRATEGY_NAMES = {
+          "PUT_CREDIT_SPREAD": "Put Credit Spread",
+          "CALL_CREDIT_SPREAD": "Call Credit Spread", 
+          "IRON_CONDOR": "Iron Condor",
+          "COVERED_CALL": "Covered Call",
+          "CASH_SECURED_PUT": "Cash-Secured Put",
+          "BULL_PUT_SPREAD": "Bull Put Spread",
+          "BEAR_CALL_SPREAD": "Bear Call Spread"
+      }
+      
+      return STRATEGY_NAMES.get(trade.strategy_type, trade.strategy_type)
+  ```
+  
+  **Legs Description Formatting:**
+  ```python
+  def format_legs_description(trade):
+      """Format option legs for display"""
+      
+      if trade.strategy_type == "PUT_CREDIT_SPREAD":
+          short_strike = max(leg.strike for leg in trade.legs if leg.action == "SELL")
+          long_strike = min(leg.strike for leg in trade.legs if leg.action == "BUY")
+          expiration = trade.legs[0].expiration_date.strftime("%m/%d")
+          return f"S{short_strike}P/B{long_strike}P {expiration}"
+      
+      elif trade.strategy_type == "CALL_CREDIT_SPREAD":
+          short_strike = min(leg.strike for leg in trade.legs if leg.action == "SELL")
+          long_strike = max(leg.strike for leg in trade.legs if leg.action == "BUY")
+          expiration = trade.legs[0].expiration_date.strftime("%m/%d")
+          return f"S{short_strike}C/B{long_strike}C {expiration}"
+      
+      elif trade.strategy_type == "IRON_CONDOR":
+          puts = [leg for leg in trade.legs if leg.option_type == "PUT"]
+          calls = [leg for leg in trade.legs if leg.option_type == "CALL"]
+          
+          short_put = max(leg.strike for leg in puts if leg.action == "SELL")
+          long_put = min(leg.strike for leg in puts if leg.action == "BUY")
+          short_call = min(leg.strike for leg in calls if leg.action == "SELL")
+          long_call = max(leg.strike for leg in calls if leg.action == "BUY")
+          
+          expiration = trade.legs[0].expiration_date.strftime("%m/%d")
+          return f"{long_put}/{short_put}/{short_call}/{long_call} {expiration}"
+      
+      elif trade.strategy_type == "COVERED_CALL":
+          call_leg = next(leg for leg in trade.legs if leg.option_type == "CALL")
+          expiration = call_leg.expiration_date.strftime("%m/%d")
+          return f"Stock+S{call_leg.strike}C {expiration}"
+      
+      else:
+          # Generic formatting for other strategies
+          leg_strs = []
+          for leg in trade.legs:
+              action = "S" if leg.action == "SELL" else "B"
+              option_type = "P" if leg.option_type == "PUT" else "C"
+              leg_strs.append(f"{action}{leg.strike}{option_type}")
+          
+          expiration = trade.legs[0].expiration_date.strftime("%m/%d")
+          return f"{'/'.join(leg_strs)} {expiration}"
+  ```
+  
+  **Thesis Generation:**
+  ```python
+  def generate_thesis(trade):
+      """Generate concise thesis (≤30 words) based on trade rationale"""
+      
+      # Template theses based on strategy type and market conditions
+      if trade.strategy_type == "PUT_CREDIT_SPREAD":
+          if trade.momentum_z > 0.5:
+              thesis = f"Bullish momentum with {trade.momentum_z:.1f}σ upside. High IV rank {trade.iv_rank:.0f}% enables premium collection below support."
+          else:
+              thesis = f"Range-bound expectations. Collect premium at {trade.short_strike} strike with {trade.pop:.0%} profit probability."
+      
+      elif trade.strategy_type == "CALL_CREDIT_SPREAD":
+          if trade.momentum_z < -0.5:
+              thesis = f"Bearish momentum {trade.momentum_z:.1f}σ. High IV rank {trade.iv_rank:.0f}% favors premium selling above resistance."
+          else:
+              thesis = f"Capped upside trade. Collect premium above {trade.short_strike} with strong time decay."
+      
+      elif trade.strategy_type == "IRON_CONDOR":
+          thesis = f"Range-bound market expected. IV rank {trade.iv_rank:.0f}% high. Profit from time decay in consolidation."
+      
+      elif trade.strategy_type == "COVERED_CALL":
+          thesis = f"Income generation on existing shares. {trade.annualized_return:.1%} annual yield with moderate upside cap."
+      
+      else:
+          # Generic thesis based on key metrics
+          thesis = f"Favorable risk/reward with {trade.pop:.0%} win rate. Strong technical setup supports directional bias."
+      
+      # Ensure thesis is ≤30 words
+      words = thesis.split()
+      if len(words) > 30:
+          thesis = ' '.join(words[:30]) + '...'
+      
+      return thesis
+  ```
+  
+  **Example Output:**
+  ```
+  Ticker   | Strategy             | Legs                           | Thesis                              | POP   
+  ------------------------------------------------------------------------------------------------
+  AAPL     | Put Credit Spread    | S185P/B180P 01/17              | Bullish momentum 1.2σ upside. IV   | 0.68
+  MSFT     | Iron Condor          | 380/390/420/430 01/17          | Range-bound market expected. IV     | 0.71  
+  GOOGL    | Call Credit Spread   | S175C/B180C 01/24              | Bearish momentum -0.8σ. High IV    | 0.66
+  TSLA     | Put Credit Spread    | S240P/B235P 01/17              | Range-bound expectations. Collect   | 0.69
+  NVDA     | Covered Call         | Stock+S580C 01/31              | Income generation on existing       | 0.72
+  ```
+
+### 25. Output Validation Framework
+- Create pre-output validation system:
+  - Real-time market data verification
+  - Strategy implementability confirmation
+  - Mathematical consistency checks across all metrics
+  - Cross-validation against independent pricing models
+- Implement post-generation quality control:
+  - Strategy replication verification
+  - Risk scenario edge case testing
+  - Performance expectation reality checking
+  - User experience validation for clarity
+
+### 26. Final Selection Logic
+- Build trade selection system that:
+  - Selects top 5 trades meeting all constraints
+  - Displays "Fewer than 5 trades meet criteria, do not execute" when appropriate
+  - Ensures portfolio-level constraints are maintained
+  - Validates final portfolio Greeks within limits
+- Add execution timing recommendations
+- Create trade expiration and monitoring alerts
+
+### 27. Quality Assurance Pipeline
+- Implement comprehensive validation checks:
+  - Strategy leg availability across exchanges
+  - Margin requirement calculations
+  - Commission impact analysis
+  - Regulatory compliance for retail trading
+- Add output consistency verification
+- Create accuracy audit trail for all recommendations
+
+## Phase 7: Testing & Quality Assurance
+
+### 28. Unit Testing Framework
+- Create comprehensive unit tests with specific test cases:
+  
+  **Mathematical Validation Tests:**
+  ```python
+  def test_black_scholes_greeks():
+      """Test Greeks calculations against known values"""
+      # Test case: AAPL call option
+      S = 150.0  # Stock price
+      K = 155.0  # Strike price  
+      T = 0.0833  # 30 days to expiration
+      r = 0.05   # Risk-free rate
+      sigma = 0.25  # Volatility
+      
+      expected_delta = 0.4316  # Known correct value
+      calculated_delta = calculate_call_delta(S, K, T, r, sigma)
+      
+      assert abs(calculated_delta - expected_delta) < 0.001, f"Delta calculation failed: {calculated_delta} vs {expected_delta}"
+  
+  def test_pop_calculations():
+      """Test POP calculations for different strategies"""
+      # Credit spread test case
+      spread = {
+          'short_strike': 100,
+          'long_strike': 95,
+          'net_credit': 2.0,
+          'strike_width': 5.0
+      }
+      
+      expected_pop = 0.60  # (5-2)/5 = 0.60
+      calculated_pop = calculate_credit_spread_pop(spread)
+      
+      assert abs(calculated_pop - expected_pop) < 0.01
+  
+  def test_portfolio_greeks():
+      """Test portfolio Greeks aggregation"""
+      trades = [
+          create_test_trade(delta=0.25, gamma=0.05, theta=-0.10, vega=0.15),
+          create_test_trade(delta=-0.15, gamma=0.03, theta=-0.08, vega=0.12)
+      ]
+      
+      portfolio_greeks = calculate_portfolio_greeks(trades, nav=100000)
+      
+      assert abs(portfolio_greeks['delta'] - 0.10) < 0.001
+      assert abs(portfolio_greeks['gamma'] - 0.08) < 0.001
+  ```
+  
+  **API Integration Tests:**
+  ```python
+  def test_tradier_api_integration():
+      """Test Tradier API calls with mock responses"""
+      mock_response = {
+          "options": {
+              "option": [
+                  {
+                      "symbol": "AAPL250117P00150000",
+                      "strike": 150.0,
+                      "bid": 2.50,
+                      "ask": 2.55,
+                      "delta": -0.35,
+                      "gamma": 0.05,
+                      "theta": -0.08,
+                      "vega": 0.12,
+                      "implied_volatility": 0.25
+                  }
+              ]
+          }
+      }
+      
+      with mock.patch('requests.get') as mock_get:
+          mock_get.return_value.json.return_value = mock_response
+          
+          options_data = tradier_client.get_options_chain("AAPL")
+          
+          assert len(options_data) == 1
+          assert options_data[0].strike == 150.0
+          assert options_data[0].delta == -0.35
+  
+  def test_api_error_handling():
+      """Test API failure and retry logic"""
+      with mock.patch('requests.get') as mock_get:
+          # Simulate 3 failures then success
+          mock_get.side_effect = [
+              requests.RequestException("Connection failed"),
+              requests.RequestException("Timeout"),
+              requests.RequestException("Server error"),
+              mock.Mock(status_code=200, json=lambda: {"success": True})
+          ]
+          
+          # Should succeed after retries
+          result = api_client.make_request_with_retry("test_endpoint")
+          assert result["success"] is True
+          assert mock_get.call_count == 4
+  ```
+  
+  **Constraint Testing:**
+  ```python
+  def test_constraint_validation():
+      """Test all hard constraints"""
+      
+      # Test POP constraint
+      trade_low_pop = create_test_trade(pop=0.60)
+      trade_high_pop = create_test_trade(pop=0.70)
+      
+      assert not validate_pop_constraint(trade_low_pop)
+      assert validate_pop_constraint(trade_high_pop)
+      
+      # Test credit ratio constraint
+      trade_low_ratio = create_test_trade(net_credit=1.0, max_loss=4.0)  # 0.25 ratio
+      trade_high_ratio = create_test_trade(net_credit=2.0, max_loss=5.0)  # 0.40 ratio
+      
+      assert not validate_credit_ratio(trade_low_ratio)
+      assert validate_credit_ratio(trade_high_ratio)
+      
+      # Test sector diversification
+      trades = [
+          create_test_trade(ticker="AAPL"),  # Tech
+          create_test_trade(ticker="MSFT"),  # Tech
+      ]
+      new_tech_trade = create_test_trade(ticker="GOOGL")  # Tech
+      new_health_trade = create_test_trade(ticker="JNJ")  # Health Care
+      
+      assert not validate_sector_diversification(trades, new_tech_trade)
+      assert validate_sector_diversification(trades, new_health_trade)
+  ```
+
+### 29. Integration Testing
+- Build integration tests for:
+  - End-to-end API data flow
+  - Cross-component data consistency
+  - Error propagation through system
+  - Cache behavior and invalidation
+  - Configuration changes and system response
+- Implement API failure simulation and recovery testing
+- Add database and external service integration tests
+- Create load testing for concurrent operations
+
+### 30. Historical Backtesting
+- Implement backtesting framework:
+  - Historical market data replay capabilities
+  - Strategy performance validation over time
+  - Risk metric accuracy verification
+  - Model predictive power assessment
+  - Parameter sensitivity analysis
+- Add market regime testing across different conditions
+- Create overfitting detection through out-of-sample testing
+- Implement walk-forward analysis for model validation
+
+### 31. Stress Testing and Edge Cases
+- Build comprehensive stress testing:
+  - Market crash simulation with liquidity constraints
+  - High volatility periods with expanded spreads
+  - API outage scenarios with degraded data
+  - Extreme market condition testing
+  - Memory and resource exhaustion testing
+- Create edge case testing for mathematical functions
+- Add boundary condition testing for all constraints
+- Implement chaos engineering for system resilience
+
+## Phase 8: Performance Optimization & Monitoring
+
+### 32. Performance Optimization
+- Implement computational optimizations:
+  - API call batching and intelligent caching
+  - Parallel processing for independent calculations
+  - Memory usage optimization for large datasets
+  - Algorithm efficiency improvements
+  - Database query optimization
+- Add performance profiling and bottleneck identification
+- Create lazy loading for non-critical data
+- Implement connection pooling for API calls
+
+### 33. Monitoring and Alerting
+- Build comprehensive monitoring system:
+  - Real-time performance metrics collection
+  - API health and response time monitoring
+  - Data quality degradation detection
+  - System resource utilization tracking
+  - Trade recommendation accuracy monitoring
+- Implement alerting for:
+  - API failures and service degradation
+  - Data quality issues and staleness
+  - Performance threshold breaches
+  - System resource exhaustion
+  - Trade recommendation anomalies
+
+### 34. Continuous Improvement Framework
+- Create feedback collection system:
+  - Trade outcome tracking for model improvement
+  - User satisfaction metrics and feedback
+  - Model performance attribution analysis
+  - System reliability and uptime tracking
+- Implement automated model retraining:
+  - Rolling performance evaluation
+  - Parameter optimization based on outcomes
+  - A/B testing for model improvements
+  - Feature importance analysis
+
+### 35. Documentation and Deployment
+- Create comprehensive documentation:
+  - Technical API documentation with examples
+  - User configuration guide with parameter explanations
+  - Troubleshooting guide with common issues
+  - Performance tuning recommendations
+  - Integration guide for extensions
+- Implement deployment procedures:
+  - Environment setup automation
+  - Configuration validation scripts
+  - Health check procedures
+  - Rollback procedures for failures
+  - Monitoring setup automation
+
+## Final Integration and Validation
+
+### 36. End-to-End System Testing
+- Conduct complete system validation:
+  - Full workflow testing with real market data
+  - Multi-user scenario testing
+  - Extended runtime stability testing
+  - Resource usage monitoring under load
+  - Output quality verification over time
+- Validate all requirements from project specification:
+  - Exact output format compliance
+  - All constraint enforcement
+  - Performance requirements met
+  - Data freshness requirements satisfied
+
+### 37. Production Readiness Checklist
+- Verify all components meet production standards:
+  - Error handling covers all failure modes
+  - Logging provides adequate debugging information
+  - Performance meets specified requirements
+  - Security considerations addressed
+  - Documentation complete and accurate
+- Conduct final code review and quality audit
+- Validate configuration management and deployment procedures
+- Ensure monitoring and alerting systems are operational
+
+### 38. User Acceptance Testing
+- Create test scenarios covering all use cases:
+  - Different market conditions and regimes
+  - Various user configuration scenarios
+  - Edge cases and error conditions
+  - Performance under different load levels
+- Validate output meets user expectations:
+  - Trade recommendations are actionable
+  - Risk metrics are accurate and meaningful
+  - Thesis explanations are clear and relevant
+  - System behavior is predictable and reliable
+
+## Final Integration and Main Execution Flow
+
+### 39. Main Application Orchestration
+- Create main execution engine in `src/presentation/cli/main.py`:
+  
+  **Main Execution Flow:**
+  ```python
+  def main():
+      """Main execution function"""
+      
+      # 1. Load and validate configuration
+      config = load_configuration()
+      validate_configuration(config)
+      
+      # 2. Initialize all API clients
+      api_clients = initialize_api_clients(config.api_keys)
+      
+      # 3. Determine ticker universe
+      if config.use_watchlist:
+          tickers = config.watchlist
+      else:
+          tickers = get_top_optionable_tickers(limit=500)
+      
+      # 4. Data collection phase
+      logger.info(f"Starting data collection for {len(tickers)} tickers")
+      market_data = collect_all_market_data(tickers, api_clients)
+      
+      # 5. Strategy generation phase
+      logger.info("Generating option strategies")
+      all_strategies = []
+      for ticker in tickers:
+          ticker_strategies = generate_all_strategies(ticker, market_data[ticker])
+          all_strategies.extend(ticker_strategies)
+      
+      # 6. Filtering phase
+      logger.info(f"Filtering {len(all_strategies)} potential strategies")
+      filtered_strategies = apply_all_constraints(all_strategies, config)
+      
+      # 7. Scoring and ranking phase
+      logger.info(f"Scoring {len(filtered_strategies)} valid strategies")
+      for strategy in filtered_strategies:
+          strategy.model_score = calculate_model_score(strategy)
+          strategy.momentum_z = calculate_momentum_z_score(strategy.ticker, market_data[strategy.ticker].price_history)
+          strategy.flow_z = calculate_flow_z_score(strategy.ticker, market_data[strategy.ticker].flow_data)
+      
+      # 8. Final selection
+      result = select_final_trades(filtered_strategies, max_trades=5)
+      
+      # 9. Output generation
+      if result['message']:
+          print(result['message'])
+      else:
+          table = format_trades_table(result['trades'])
+          print(table)
+      
+      # 10. Logging and cleanup
+      log_execution_summary(len(tickers), len(all_strategies), len(filtered_strategies), len(result['trades']))
+  
+  def collect_all_market_data(tickers, api_clients):
+      """Orchestrate data collection from all sources"""
+      market_data = {}
+      
+      for ticker in tickers:
+          try:
+              ticker_data = MarketData(ticker=ticker)
+              
+              # Options data
+              ticker_data.options_chain = api_clients.tradier.get_options_chain(ticker)
+              
+              # Fundamental data  
+              ticker_data.fundamentals = api_clients.yahoo.get_fundamentals(ticker)
+              
+              # Technical data
+              ticker_data.price_history = api_clients.yahoo.get_price_history(ticker, days=252)
+              ticker_data.technical_indicators = calculate_technical_indicators(ticker_data.price_history)
+              
+              # Flow data
+              ticker_data.flow_data = api_clients.quiver.get_flow_data(ticker)
+              
+              # Validate data quality
+              if validate_data_quality(ticker_data):
+                  market_data[ticker] = ticker_data
+              else:
+                  logger.warning(f"Data quality issues for {ticker}, skipping")
+                  
+          except Exception as e:
+              logger.error(f"Failed to collect data for {ticker}: {e}")
+              continue
+      
+      return market_data
+  ```
+  
+  **Configuration Loading:**
+  ```python
+  def load_configuration():
+      """Load and merge configuration from multiple sources"""
+      
+      # Load default configuration
+      default_config = yaml.safe_load(open('config/settings.yaml'))
+      
+      # Load user configuration if exists
+      user_config_path = os.getenv('OPTIONS_ENGINE_CONFIG', 'user_config.yaml')
+      user_config = {}
+      if os.path.exists(user_config_path):
+          user_config = yaml.safe_load(open(user_config_path))
+      
+      # Merge configurations (user overrides default)
+      config = {**default_config, **user_config}
+      
+      # Load API keys from environment
+      config['api_keys'] = {
+          'tradier': os.getenv('TRADIER_API_KEY'),
+          'yahoo': os.getenv('YAHOO_FINANCE_API_KEY'),
+          'fred': os.getenv('FRED_API_KEY'),
+          'quiver': os.getenv('QUIVER_QUANT_API_KEY'),
+          'alpaca': os.getenv('ALPACA_API_KEY')
+      }
+      
+      return Config(**config)
+  
+  def validate_configuration(config):
+      """Validate configuration against schema"""
+      
+      # Required fields validation
+      required_fields = ['nav', 'available_capital', 'max_loss_per_trade']
+      for field in required_fields:
+          if not hasattr(config, field) or getattr(config, field) is None:
+              raise ConfigurationError(f"Required field '{field}' missing")
+      
+      # Range validations
+      if config.nav <= 0:
+          raise ConfigurationError("NAV must be positive")
+      
+      if config.available_capital > config.nav:
+          raise ConfigurationError("Available capital cannot exceed NAV")
+      
+      if config.max_loss_per_trade <= 0:
+          raise ConfigurationError("Max loss per trade must be positive")
+      
+      # API key validation
+      missing_keys = [k for k, v in config.api_keys.items() if not v]
+      if missing_keys:
+          logger.warning(f"Missing API keys: {missing_keys}")
+  ```
+
+### 40. Performance Requirements and Monitoring
+- Implement performance targets and monitoring:
+  
+  **Performance Requirements:**
+  ```python
+  # Target execution times (configurable)
+  PERFORMANCE_TARGETS = {
+      'data_collection_per_ticker': 2.0,  # seconds
+      'strategy_generation_per_ticker': 1.0,  # seconds
+      'total_execution_time': 300.0,  # 5 minutes max
+      'api_response_time': 5.0,  # seconds
+  }
+  
+  def monitor_performance():
+      """Monitor system performance against targets"""
+      
+      @contextmanager
+      def time_operation(operation_name):
+          start_time = time.time()
+          yield
+          duration = time.time() - start_time
+          
+          target = PERFORMANCE_TARGETS.get(operation_name)
+          if target and duration > target:
+              logger.warning(f"{operation_name} took {duration:.2f}s (target: {target}s)")
+          else:
+              logger.info(f"{operation_name} completed in {duration:.2f}s")
+      
+      return time_operation
+  ```
+  
+  **Resource Monitoring:**
+  ```python
+  def check_system_resources():
+      """Monitor memory and CPU usage"""
+      import psutil
+      
+      memory_usage = psutil.virtual_memory().percent
+      cpu_usage = psutil.cpu_percent(interval=1)
+      
+      if memory_usage > 80:
+          logger.warning(f"High memory usage: {memory_usage}%")
+      
+      if cpu_usage > 80:
+          logger.warning(f"High CPU usage: {cpu_usage}%")
+      
+      return {'memory': memory_usage, 'cpu': cpu_usage}
+  ```
+
+### 41. Error Recovery and Graceful Degradation
+- Implement comprehensive error handling:
+  
+  **API Failure Recovery:**
+  ```python
+  def handle_api_failures(primary_func, fallback_func, error_message):
+      """Generic API failure handler with fallback"""
+      try:
+          return primary_func()
+      except Exception as e:
+          logger.warning(f"{error_message}: {e}")
+          try:
+              return fallback_func()
+          except Exception as fallback_error:
+              logger.error(f"Fallback also failed: {fallback_error}")
+              raise DataUnavailableError(f"All data sources failed for {error_message}")
+  
+  def graceful_degradation_modes():
+      """Define system behavior when components fail"""
+      
+      # Mode 1: Reduced ticker universe
+      if get_api_health('options_data') < 0.5:
+          logger.warning("Options API unhealthy, reducing ticker universe")
+          return "REDUCED_UNIVERSE"
+      
+      # Mode 2: Cached data only
+      if get_api_health('market_data') < 0.3:
+          logger.warning("Market data APIs failing, using cached data only")
+          return "CACHED_ONLY"
+      
+      # Mode 3: Emergency stop
+      if get_api_health('all') < 0.2:
+          logger.error("Critical system failure, stopping execution")
+          return "EMERGENCY_STOP"
+      
+      return "NORMAL"
+  ```
+
+### 42. Final Quality Assurance Checklist
+- Before deployment, verify ALL requirements are met:
+  
+  **Functional Requirements Checklist:**
+  ```
+  ☐ Outputs exactly 5 trades or "Fewer than 5 trades meet criteria" message
+  ☐ All hard constraints enforced (POP ≥ 0.65, max loss ≤ $500, etc.)
+  ☐ Portfolio Greeks within limits: Delta [-0.30, +0.30] × NAV/100k, Vega ≥ -0.05 × NAV/100k
+  ☐ Maximum 2 trades per GICS sector
+  ☐ Quote age ≤ 10 minutes enforced
+  ☐ Credit-to-max-loss ratio ≥ 0.33 enforced
+  ☐ Table output is console-friendly and fixed-width
+  ☐ Thesis generation ≤ 30 words per trade
+  ☐ All mathematical calculations verified (Greeks, POP, Z-scores)
+  ☐ API integrations working with proper error handling
+  ☐ Configuration system accepts all required parameters
+  ☐ Performance targets met (< 5 minutes total execution)
+  ☐ Comprehensive logging and error reporting
+  ☐ All tests passing (unit, integration, end-to-end)
+  ```
+  
+  **Final Validation Script:**
+  ```python
+  def run_final_validation():
+      """Comprehensive system validation before production"""
+      
+      validation_results = {}
+      
+      # Test with known good configuration
+      test_config = {
+          'nav': 100000,
+          'available_capital': 5000,
+          'watchlist': ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA']
+      }
+      
+      # Run full execution with test data
+      start_time = time.time()
+      result = main_execution_flow(test_config)
+      execution_time = time.time() - start_time
+      
+      # Validate results
+      validation_results['execution_time'] = execution_time < 300  # 5 minutes
+      validation_results['output_format'] = validate_output_format(result)
+      validation_results['constraint_compliance'] = validate_constraints_compliance(result)
+      validation_results['portfolio_greeks'] = validate_portfolio_greeks_limits(result)
+      
+      # Summary
+      all_passed = all(validation_results.values())
+      
+      if all_passed:
+          logger.info("✅ All validation checks passed - System ready for production")
+      else:
+          failed_checks = [k for k, v in validation_results.items() if not v]
+          logger.error(f"❌ Validation failed: {failed_checks}")
+          
+      return all_passed
+  ```
+
+This completes the comprehensive development instructions. The developer now has:
+
+1. **Exact mathematical formulas** for all calculations
+2. **Specific API endpoints and authentication** methods  
+3. **Detailed algorithms** for strategy construction
+4. **Precise constraint checking** logic
+5. **Complete scoring and ranking** specifications
+6. **Exact output formatting** requirements
+7. **Comprehensive testing** frameworks
+8. **Performance monitoring** and error handling
+9. **Integration orchestration** and validation
+
+The instructions now provide sufficient detail for a skilled developer to implement a fully functional options trade discovery engine that meets all project requirements.

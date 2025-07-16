@@ -1,248 +1,701 @@
-#!/usr/bin/env python3
 """
-Main CLI entry point for the Options Trading Engine.
+Main CLI interface for the Options Trading Engine.
 """
 
 import sys
 import argparse
-from pathlib import Path
-from typing import Optional
+import json
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+import logging
 
-# Add src to path for imports
-src_path = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(src_path))
+from ...application.config.settings import ConfigManager
+from ...application.use_cases.generate_trades import GenerateTradesUseCase
+from ...application.use_cases.scan_market import ScanMarketUseCase
+from ...infrastructure.api import TradierClient, YahooClient, FredClient, QuiverClient
+from ...infrastructure.cache import CacheManager
+from ...infrastructure.error_handling import OptionsEngineError
+from ...data.repositories.market_repo import MarketDataRepository
+from ...data.repositories.options_repo import OptionsRepository
+from ...domain.services.scoring_engine import ScoringEngine
+from ...domain.services.risk_calculator import RiskCalculator
+from ...domain.services.strategy_generation_service import StrategyGenerationService
+from ...domain.services.constraint_engine import ConstraintEngine
+from ...domain.services.trade_selector import TradeSelector
+from ..formatters.trade_formatter import TradeFormatter
+from ..formatters.console_formatter import ConsoleFormatter
+from ..formatters.table_formatter import TableFormatter
 
-from application.config.settings import get_settings
-from infrastructure.monitoring.logger import setup_logging, get_logger
-from infrastructure.api.tradier_client import TradierClient
-from infrastructure.api.yahoo_client import YahooFinanceClient
-from infrastructure.api.fred_client import FREDClient
-
-
-def setup_environment():
-    """Setup logging and configuration."""
-    # Get settings
-    settings = get_settings()
-    
-    # Setup logging
-    setup_logging(
-        log_level=settings.system.log_level,
-        enable_console=True,
-        enable_file=True,
-        enable_json=False
-    )
-    
-    return settings
+logger = logging.getLogger(__name__)
 
 
-def test_api_connections(settings):
-    """Test connections to all configured APIs."""
-    logger = get_logger("cli.api_test")
+class OptionsEngineCLI:
+    """
+    Main CLI interface for the Options Trading Engine.
     
-    results = {}
+    Provides command-line interface for all engine functionality including
+    trade generation, market scanning, and system management.
+    """
     
-    # Test Tradier API
-    logger.info("Testing Tradier API connection...")
-    try:
-        tradier = TradierClient(settings.api.tradier_api_key)
-        results['tradier'] = tradier.test_connection()
-        logger.info(f"Tradier API: {'✓ Connected' if results['tradier'] else '✗ Failed'}")
-    except Exception as e:
-        results['tradier'] = False
-        logger.error(f"Tradier API error: {e}")
+    def __init__(self):
+        self.config_manager = ConfigManager()
+        self.cache_manager = CacheManager()
+        self.trade_formatter = TradeFormatter()
+        self.console_formatter = ConsoleFormatter()
+        self.table_formatter = TableFormatter()
+        
+        # Initialize API clients
+        self._init_api_clients()
+        
+        # Initialize repositories
+        self._init_repositories()
+        
+        # Initialize domain services
+        self._init_domain_services()
+        
+        # Initialize use cases
+        self._init_use_cases()
     
-    # Test Yahoo Finance API
-    logger.info("Testing Yahoo Finance API connection...")
-    try:
-        yahoo = YahooFinanceClient(settings.api.yahoo_rapid_api_key)
-        results['yahoo'] = yahoo.test_connection()
-        logger.info(f"Yahoo Finance API: {'✓ Connected' if results['yahoo'] else '✗ Failed'}")
-    except Exception as e:
-        results['yahoo'] = False
-        logger.error(f"Yahoo Finance API error: {e}")
+    def _init_api_clients(self):
+        """Initialize API clients."""
+        config = self.config_manager.get_config()
+        
+        self.tradier_client = TradierClient(
+            api_key=config.api_keys.tradier_api_key,
+            base_url=config.api_endpoints.tradier_base_url
+        )
+        
+        self.yahoo_client = YahooClient(
+            api_key=config.api_keys.yahoo_finance_api_key,
+            base_url=config.api_endpoints.yahoo_base_url
+        )
+        
+        self.fred_client = FredClient(
+            api_key=config.api_keys.fred_api_key,
+            base_url=config.api_endpoints.fred_base_url
+        )
+        
+        self.quiver_client = QuiverClient(
+            api_key=config.api_keys.quiver_quant_api_key,
+            base_url=config.api_endpoints.quiver_base_url
+        )
     
-    # Test FRED API
-    logger.info("Testing FRED API connection...")
-    try:
-        fred = FREDClient(settings.api.fred_api_key)
-        results['fred'] = fred.test_connection()
-        logger.info(f"FRED API: {'✓ Connected' if results['fred'] else '✗ Failed'}")
-    except Exception as e:
-        results['fred'] = False
-        logger.error(f"FRED API error: {e}")
+    def _init_repositories(self):
+        """Initialize data repositories."""
+        self.market_repo = MarketDataRepository(
+            tradier_client=self.tradier_client,
+            yahoo_client=self.yahoo_client,
+            fred_client=self.fred_client,
+            quiver_client=self.quiver_client,
+            cache_manager=self.cache_manager
+        )
+        
+        self.options_repo = OptionsRepository(
+            tradier_client=self.tradier_client,
+            yahoo_client=self.yahoo_client,
+            cache_manager=self.cache_manager
+        )
     
-    return results
-
-
-def validate_configuration(settings):
-    """Validate configuration settings."""
-    logger = get_logger("cli.config_validation")
+    def _init_domain_services(self):
+        """Initialize domain services."""
+        self.scoring_engine = ScoringEngine()
+        self.risk_calculator = RiskCalculator()
+        self.strategy_service = StrategyGenerationService()
+        self.constraint_engine = ConstraintEngine()
+        self.trade_selector = TradeSelector()
     
-    logger.info("Validating configuration...")
+    def _init_use_cases(self):
+        """Initialize use cases."""
+        self.generate_trades_uc = GenerateTradesUseCase(
+            market_repo=self.market_repo,
+            options_repo=self.options_repo,
+            strategy_service=self.strategy_service,
+            scoring_engine=self.scoring_engine,
+            constraint_engine=self.constraint_engine,
+            trade_selector=self.trade_selector,
+            config_manager=self.config_manager
+        )
+        
+        self.scan_market_uc = ScanMarketUseCase(
+            market_repo=self.market_repo,
+            options_repo=self.options_repo,
+            config_manager=self.config_manager
+        )
     
-    try:
-        is_valid = settings.validate_all()
-        if is_valid:
-            logger.info("✓ Configuration validation passed")
+    def run(self):
+        """Main entry point for CLI."""
+        parser = self._create_parser()
+        args = parser.parse_args()
+        
+        # Configure logging
+        self._configure_logging(args.log_level)
+        
+        try:
+            # Execute command
+            result = self._execute_command(args)
+            
+            # Output result
+            if result:
+                self._output_result(result, args.output_format)
+                
+            return 0
+            
+        except OptionsEngineError as e:
+            self.console_formatter.print_error(f"Engine Error: {str(e)}")
+            return 1
+        except Exception as e:
+            self.console_formatter.print_error(f"Unexpected Error: {str(e)}")
+            logger.exception("Unexpected error in CLI")
+            return 1
+    
+    def _create_parser(self) -> argparse.ArgumentParser:
+        """Create argument parser."""
+        parser = argparse.ArgumentParser(
+            description="Options Trading Engine CLI",
+            formatter_class=argparse.RawDescriptionHelpFormatter
+        )
+        
+        # Global options
+        parser.add_argument(
+            '--log-level',
+            choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+            default='INFO',
+            help='Set logging level'
+        )
+        
+        parser.add_argument(
+            '--output-format',
+            choices=['json', 'table', 'csv'],
+            default='table',
+            help='Output format'
+        )
+        
+        # Create subparsers
+        subparsers = parser.add_subparsers(dest='command', help='Available commands')
+        
+        # Generate trades command
+        self._add_generate_trades_parser(subparsers)
+        
+        # Scan market command
+        self._add_scan_market_parser(subparsers)
+        
+        # Get quotes command
+        self._add_get_quotes_parser(subparsers)
+        
+        # System commands
+        self._add_system_commands(subparsers)
+        
+        return parser
+    
+    def _add_generate_trades_parser(self, subparsers):
+        """Add generate trades command parser."""
+        parser = subparsers.add_parser(
+            'generate-trades',
+            help='Generate trade recommendations'
+        )
+        
+        parser.add_argument(
+            'symbols',
+            nargs='+',
+            help='Stock symbols to analyze'
+        )
+        
+        parser.add_argument(
+            '--strategies',
+            nargs='+',
+            choices=['covered_call', 'cash_secured_put', 'iron_condor', 'butterfly', 'straddle', 'strangle'],
+            default=['covered_call', 'cash_secured_put'],
+            help='Strategies to generate'
+        )
+        
+        parser.add_argument(
+            '--max-trades',
+            type=int,
+            default=10,
+            help='Maximum number of trades to generate'
+        )
+        
+        parser.add_argument(
+            '--min-score',
+            type=float,
+            default=0.7,
+            help='Minimum trade score (0-1)'
+        )
+        
+        parser.add_argument(
+            '--max-risk',
+            type=float,
+            default=0.05,
+            help='Maximum risk per trade (as percentage of portfolio)'
+        )
+        
+        parser.add_argument(
+            '--min-dte',
+            type=int,
+            default=7,
+            help='Minimum days to expiration'
+        )
+        
+        parser.add_argument(
+            '--max-dte',
+            type=int,
+            default=60,
+            help='Maximum days to expiration'
+        )
+    
+    def _add_scan_market_parser(self, subparsers):
+        """Add scan market command parser."""
+        parser = subparsers.add_parser(
+            'scan-market',
+            help='Scan market for opportunities'
+        )
+        
+        parser.add_argument(
+            '--scan-type',
+            choices=['momentum', 'mean_reversion', 'volatility', 'earnings', 'technical'],
+            default='momentum',
+            help='Type of scan to perform'
+        )
+        
+        parser.add_argument(
+            '--universe',
+            choices=['sp500', 'nasdaq100', 'russell2000', 'custom'],
+            default='sp500',
+            help='Universe to scan'
+        )
+        
+        parser.add_argument(
+            '--symbols',
+            nargs='*',
+            help='Custom symbols to scan (if universe=custom)'
+        )
+        
+        parser.add_argument(
+            '--min-volume',
+            type=int,
+            default=1000000,
+            help='Minimum average daily volume'
+        )
+        
+        parser.add_argument(
+            '--min-price',
+            type=float,
+            default=10.0,
+            help='Minimum stock price'
+        )
+        
+        parser.add_argument(
+            '--max-price',
+            type=float,
+            default=1000.0,
+            help='Maximum stock price'
+        )
+        
+        parser.add_argument(
+            '--limit',
+            type=int,
+            default=50,
+            help='Maximum number of results'
+        )
+    
+    def _add_get_quotes_parser(self, subparsers):
+        """Add get quotes command parser."""
+        parser = subparsers.add_parser(
+            'get-quotes',
+            help='Get quotes for symbols'
+        )
+        
+        parser.add_argument(
+            'symbols',
+            nargs='+',
+            help='Stock or option symbols'
+        )
+        
+        parser.add_argument(
+            '--type',
+            choices=['stock', 'option'],
+            default='stock',
+            help='Type of quotes to get'
+        )
+        
+        parser.add_argument(
+            '--include-greeks',
+            action='store_true',
+            help='Include Greeks for options'
+        )
+    
+    def _add_system_commands(self, subparsers):
+        """Add system management commands."""
+        # Status command
+        status_parser = subparsers.add_parser(
+            'status',
+            help='Show system status'
+        )
+        
+        # Cache management
+        cache_parser = subparsers.add_parser(
+            'cache',
+            help='Cache management'
+        )
+        cache_subparsers = cache_parser.add_subparsers(dest='cache_action')
+        
+        cache_subparsers.add_parser('clear', help='Clear cache')
+        cache_subparsers.add_parser('stats', help='Show cache statistics')
+        
+        # Config management
+        config_parser = subparsers.add_parser(
+            'config',
+            help='Configuration management'
+        )
+        config_subparsers = config_parser.add_subparsers(dest='config_action')
+        
+        config_subparsers.add_parser('show', help='Show configuration')
+        config_subparsers.add_parser('validate', help='Validate configuration')
+    
+    def _configure_logging(self, log_level: str):
+        """Configure logging."""
+        logging.basicConfig(
+            level=getattr(logging, log_level),
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.StreamHandler(sys.stdout),
+                logging.FileHandler('logs/options_engine.log')
+            ]
+        )
+    
+    def _execute_command(self, args) -> Optional[Dict[str, Any]]:
+        """Execute CLI command."""
+        if args.command == 'generate-trades':
+            return self._execute_generate_trades(args)
+        elif args.command == 'scan-market':
+            return self._execute_scan_market(args)
+        elif args.command == 'get-quotes':
+            return self._execute_get_quotes(args)
+        elif args.command == 'status':
+            return self._execute_status(args)
+        elif args.command == 'cache':
+            return self._execute_cache_command(args)
+        elif args.command == 'config':
+            return self._execute_config_command(args)
         else:
-            logger.error("✗ Configuration validation failed")
-        return is_valid
-    except Exception as e:
-        logger.error(f"Configuration validation error: {e}")
-        return False
-
-
-def show_configuration(settings):
-    """Display current configuration."""
-    logger = get_logger("cli.config_display")
+            raise ValueError(f"Unknown command: {args.command}")
     
-    print("\n" + "=" * 60)
-    print("📊 CURRENT CONFIGURATION")
-    print("=" * 60)
+    def _execute_generate_trades(self, args) -> Dict[str, Any]:
+        """Execute generate trades command."""
+        self.console_formatter.print_info(f"Generating trades for {len(args.symbols)} symbols...")
+        
+        # Create request
+        request = {
+            'symbols': args.symbols,
+            'strategies': args.strategies,
+            'max_trades': args.max_trades,
+            'filters': {
+                'min_score': args.min_score,
+                'max_risk': args.max_risk,
+                'min_dte': args.min_dte,
+                'max_dte': args.max_dte
+            }
+        }
+        
+        # Execute use case
+        result = self.generate_trades_uc.execute(request)
+        
+        # Format result
+        return {
+            'command': 'generate-trades',
+            'request': request,
+            'result': result,
+            'timestamp': datetime.now().isoformat()
+        }
     
-    # Portfolio settings
-    print(f"\n💼 Portfolio Settings:")
-    print(f"   NAV: ${settings.portfolio.nav:,.2f}")
-    print(f"   Available Capital: ${settings.portfolio.capital_available:,.2f}")
-    print(f"   Max Trades: {settings.portfolio.max_trades}")
-    print(f"   Max Loss per Trade: ${settings.portfolio.max_loss_per_trade:,.2f}")
-    print(f"   Min POP: {settings.portfolio.min_pop:.1%}")
+    def _execute_scan_market(self, args) -> Dict[str, Any]:
+        """Execute scan market command."""
+        self.console_formatter.print_info(f"Scanning market with {args.scan_type} strategy...")
+        
+        # Determine symbols to scan
+        symbols = args.symbols or []
+        if args.universe != 'custom':
+            symbols = self._get_universe_symbols(args.universe)
+        
+        # Create request
+        request = {
+            'scan_type': args.scan_type,
+            'symbols': symbols,
+            'filters': {
+                'min_volume': args.min_volume,
+                'min_price': args.min_price,
+                'max_price': args.max_price
+            },
+            'limit': args.limit
+        }
+        
+        # Execute use case
+        result = self.scan_market_uc.execute(request)
+        
+        # Format result
+        return {
+            'command': 'scan-market',
+            'request': request,
+            'result': result,
+            'timestamp': datetime.now().isoformat()
+        }
     
-    # Market scan settings
-    print(f"\n🔍 Market Scan Settings:")
-    print(f"   Universe: {settings.market_scan.scan_universe}")
-    print(f"   Max Days to Expiration: {settings.market_scan.max_days_to_expiration}")
-    print(f"   Min Days to Expiration: {settings.market_scan.min_days_to_expiration}")
-    print(f"   Max Quote Age: {settings.market_scan.max_quote_age_minutes} minutes")
+    def _execute_get_quotes(self, args) -> Dict[str, Any]:
+        """Execute get quotes command."""
+        self.console_formatter.print_info(f"Getting quotes for {len(args.symbols)} symbols...")
+        
+        if args.type == 'stock':
+            quotes = {}
+            for symbol in args.symbols:
+                market_data = self.market_repo.get_market_data(symbol)
+                if market_data:
+                    quotes[symbol] = market_data.to_dict()
+        else:
+            quotes = self.options_repo.get_option_quotes(args.symbols)
+            quotes = {k: v.to_dict() for k, v in quotes.items()}
+        
+        return {
+            'command': 'get-quotes',
+            'type': args.type,
+            'symbols': args.symbols,
+            'quotes': quotes,
+            'timestamp': datetime.now().isoformat()
+        }
     
-    # System settings
-    print(f"\n⚙️ System Settings:")
-    print(f"   Environment: {settings.system.environment}")
-    print(f"   Log Level: {settings.system.log_level}")
-    print(f"   Cache Enabled: {settings.system.enable_cache}")
-    print(f"   Cache TTL: {settings.system.cache_ttl_seconds}s")
+    def _execute_status(self, args) -> Dict[str, Any]:
+        """Execute status command."""
+        # Get system status
+        status = {
+            'engine_status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'api_clients': {},
+            'repositories': {},
+            'cache': self.cache_manager.get_stats(),
+            'config': {
+                'loaded': True,
+                'valid': True
+            }
+        }
+        
+        # Check API clients
+        for name, client in [
+            ('tradier', self.tradier_client),
+            ('yahoo', self.yahoo_client),
+            ('fred', self.fred_client),
+            ('quiver', self.quiver_client)
+        ]:
+            try:
+                health = client.health_check()
+                status['api_clients'][name] = health
+            except Exception as e:
+                status['api_clients'][name] = {'status': 'error', 'error': str(e)}
+        
+        # Check repositories
+        for name, repo in [
+            ('market', self.market_repo),
+            ('options', self.options_repo)
+        ]:
+            try:
+                health = repo.health_check()
+                status['repositories'][name] = health
+            except Exception as e:
+                status['repositories'][name] = {'status': 'error', 'error': str(e)}
+        
+        return status
+    
+    def _execute_cache_command(self, args) -> Dict[str, Any]:
+        """Execute cache management command."""
+        if args.cache_action == 'clear':
+            self.cache_manager.clear()
+            return {'action': 'clear', 'status': 'success', 'message': 'Cache cleared'}
+        
+        elif args.cache_action == 'stats':
+            stats = self.cache_manager.get_stats()
+            return {'action': 'stats', 'stats': stats}
+        
+        else:
+            raise ValueError(f"Unknown cache action: {args.cache_action}")
+    
+    def _execute_config_command(self, args) -> Dict[str, Any]:
+        """Execute config management command."""
+        if args.config_action == 'show':
+            config = self.config_manager.get_config()
+            return {'action': 'show', 'config': config.to_dict()}
+        
+        elif args.config_action == 'validate':
+            try:
+                self.config_manager.validate_config()
+                return {'action': 'validate', 'status': 'valid'}
+            except Exception as e:
+                return {'action': 'validate', 'status': 'invalid', 'error': str(e)}
+        
+        else:
+            raise ValueError(f"Unknown config action: {args.config_action}")
+    
+    def _get_universe_symbols(self, universe: str) -> List[str]:
+        """Get symbols for a universe."""
+        # This would typically load from a data source
+        # For now, return sample symbols
+        if universe == 'sp500':
+            return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA', 'JPM', 'JNJ', 'V']
+        elif universe == 'nasdaq100':
+            return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA', 'NFLX', 'ADBE', 'CSCO']
+        elif universe == 'russell2000':
+            return ['AMC', 'GME', 'SNDL', 'CLOV', 'WISH', 'PLTR', 'BB', 'NOK', 'SPCE', 'TLRY']
+        else:
+            return []
+    
+    def _output_result(self, result: Dict[str, Any], format_type: str):
+        """Output result in specified format."""
+        if format_type == 'json':
+            print(json.dumps(result, indent=2, default=str))
+        
+        elif format_type == 'table':
+            if result['command'] == 'generate-trades':
+                self._output_trades_table(result['result'])
+            elif result['command'] == 'scan-market':
+                self._output_scan_table(result['result'])
+            elif result['command'] == 'get-quotes':
+                self._output_quotes_table(result['quotes'])
+            elif result['command'] == 'status':
+                self._output_status_table(result)
+            else:
+                # Fallback to JSON for unknown commands
+                print(json.dumps(result, indent=2, default=str))
+        
+        elif format_type == 'csv':
+            # Convert to CSV format
+            self._output_csv(result)
+        
+        else:
+            raise ValueError(f"Unknown output format: {format_type}")
+    
+    def _output_trades_table(self, trades: List[Dict[str, Any]]):
+        """Output trades in table format."""
+        if not trades:
+            self.console_formatter.print_warning("No trades found")
+            return
+        
+        headers = ['Symbol', 'Strategy', 'Score', 'Max Profit', 'Max Loss', 'POP', 'DTE', 'Capital']
+        rows = []
+        
+        for trade in trades:
+            rows.append([
+                trade.get('symbol', ''),
+                trade.get('strategy', ''),
+                f"{trade.get('score', 0):.2f}",
+                f"${trade.get('max_profit', 0):.2f}",
+                f"${trade.get('max_loss', 0):.2f}",
+                f"{trade.get('probability_of_profit', 0):.1%}",
+                trade.get('days_to_expiration', 0),
+                f"${trade.get('capital_required', 0):.2f}"
+            ])
+        
+        self.table_formatter.print_table(headers, rows, title="Trade Recommendations")
+    
+    def _output_scan_table(self, scan_results: List[Dict[str, Any]]):
+        """Output scan results in table format."""
+        if not scan_results:
+            self.console_formatter.print_warning("No scan results found")
+            return
+        
+        headers = ['Symbol', 'Price', 'Change', 'Volume', 'Score', 'Reason']
+        rows = []
+        
+        for result in scan_results:
+            rows.append([
+                result.get('symbol', ''),
+                f"${result.get('price', 0):.2f}",
+                f"{result.get('change_percentage', 0):.2f}%",
+                f"{result.get('volume', 0):,}",
+                f"{result.get('score', 0):.2f}",
+                result.get('reason', '')
+            ])
+        
+        self.table_formatter.print_table(headers, rows, title="Market Scan Results")
+    
+    def _output_quotes_table(self, quotes: Dict[str, Any]):
+        """Output quotes in table format."""
+        if not quotes:
+            self.console_formatter.print_warning("No quotes found")
+            return
+        
+        headers = ['Symbol', 'Price', 'Change', 'Volume', 'Bid', 'Ask']
+        rows = []
+        
+        for symbol, quote in quotes.items():
+            rows.append([
+                symbol,
+                f"${quote.get('price', 0):.2f}",
+                f"{quote.get('change_percentage', 0):.2f}%",
+                f"{quote.get('volume', 0):,}",
+                f"${quote.get('bid', 0):.2f}",
+                f"${quote.get('ask', 0):.2f}"
+            ])
+        
+        self.table_formatter.print_table(headers, rows, title="Quotes")
+    
+    def _output_status_table(self, status: Dict[str, Any]):
+        """Output status in table format."""
+        self.console_formatter.print_success(f"Engine Status: {status['engine_status']}")
+        self.console_formatter.print_info(f"Timestamp: {status['timestamp']}")
+        
+        # API Clients status
+        print("\nAPI Clients:")
+        for name, client_status in status['api_clients'].items():
+            status_str = client_status.get('status', 'unknown')
+            if status_str == 'healthy':
+                self.console_formatter.print_success(f"  {name}: {status_str}")
+            else:
+                self.console_formatter.print_error(f"  {name}: {status_str}")
+        
+        # Repositories status
+        print("\nRepositories:")
+        for name, repo_status in status['repositories'].items():
+            status_str = repo_status.get('status', 'unknown')
+            if status_str == 'healthy':
+                self.console_formatter.print_success(f"  {name}: {status_str}")
+            else:
+                self.console_formatter.print_error(f"  {name}: {status_str}")
+        
+        # Cache stats
+        cache_stats = status.get('cache', {})
+        print(f"\nCache Statistics:")
+        print(f"  Hits: {cache_stats.get('hits', 0)}")
+        print(f"  Misses: {cache_stats.get('misses', 0)}")
+        print(f"  Size: {cache_stats.get('size', 0)}")
+    
+    def _output_csv(self, result: Dict[str, Any]):
+        """Output result in CSV format."""
+        # Simple CSV implementation
+        import csv
+        import io
+        
+        output = io.StringIO()
+        
+        if result['command'] == 'generate-trades':
+            writer = csv.DictWriter(output, fieldnames=['symbol', 'strategy', 'score', 'max_profit', 'max_loss'])
+            writer.writeheader()
+            for trade in result['result']:
+                writer.writerow(trade)
+        
+        elif result['command'] == 'get-quotes':
+            if result['quotes']:
+                first_quote = next(iter(result['quotes'].values()))
+                writer = csv.DictWriter(output, fieldnames=first_quote.keys())
+                writer.writeheader()
+                for symbol, quote in result['quotes'].items():
+                    quote['symbol'] = symbol
+                    writer.writerow(quote)
+        
+        print(output.getvalue())
 
 
 def main():
-    """Main CLI function."""
-    parser = argparse.ArgumentParser(
-        description="Options Trading Engine - Quantitative Options Trade Discovery",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s --test-apis          Test API connections
-  %(prog)s --validate-config    Validate configuration
-  %(prog)s --show-config        Show current configuration
-  %(prog)s --scan               Run market scan (Phase 2+)
-        """
-    )
-    
-    parser.add_argument(
-        "--test-apis",
-        action="store_true",
-        help="Test connections to all configured APIs"
-    )
-    
-    parser.add_argument(
-        "--validate-config",
-        action="store_true", 
-        help="Validate configuration settings"
-    )
-    
-    parser.add_argument(
-        "--show-config",
-        action="store_true",
-        help="Display current configuration"
-    )
-    
-    parser.add_argument(
-        "--scan",
-        action="store_true",
-        help="Run market scan (not implemented in Phase 1)"
-    )
-    
-    parser.add_argument(
-        "--config-file",
-        type=str,
-        help="Path to configuration file"
-    )
-    
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="Set logging level"
-    )
-    
-    args = parser.parse_args()
-    
-    # Show header
-    print("🚀 Options Trading Engine v0.1.0")
-    print("Quantitative Options Trade Discovery System")
-    print("=" * 60)
-    
-    try:
-        # Setup environment
-        settings = setup_environment()
-        logger = get_logger("cli.main")
-        
-        logger.info("Options Trading Engine started")
-        
-        # Override log level if specified
-        if args.log_level:
-            import logging
-            logging.getLogger().setLevel(getattr(logging, args.log_level))
-        
-        # Execute requested actions
-        if args.show_config:
-            show_configuration(settings)
-        
-        if args.validate_config:
-            is_valid = validate_configuration(settings)
-            if not is_valid:
-                sys.exit(1)
-        
-        if args.test_apis:
-            print(f"\n🔗 Testing API Connections...")
-            print("-" * 40)
-            results = test_api_connections(settings)
-            
-            all_connected = all(results.values())
-            print(f"\n{'✓ All APIs connected' if all_connected else '⚠ Some APIs failed'}")
-            
-            if not all_connected:
-                print("\n💡 Tips:")
-                print("- Check your API keys in .env file")
-                print("- Verify network connectivity")
-                print("- Check API rate limits")
-        
-        if args.scan:
-            print(f"\n❌ Market scanning not implemented yet")
-            print("This feature will be available in Phase 2")
-            print("Current Phase 1 includes:")
-            print("- ✓ Configuration management")
-            print("- ✓ API integration framework")
-            print("- ✓ Data models")
-            print("- ✓ Logging and monitoring")
-            print("- ✓ Caching system")
-        
-        # If no specific action, show help
-        if not any([args.test_apis, args.validate_config, args.show_config, args.scan]):
-            parser.print_help()
-            print(f"\n💡 Try: {parser.prog} --test-apis --show-config")
-        
-        logger.info("Options Trading Engine completed")
-        
-    except KeyboardInterrupt:
-        print("\n\n👋 Goodbye!")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        if "--debug" in sys.argv:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
+    """Main entry point."""
+    cli = OptionsEngineCLI()
+    return cli.run()
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,456 +1,284 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Options Trading Engine Configuration Schema",
+  "description": "JSON schema for validating Options Trading Engine configuration",
   "type": "object",
-  "title": "Options Engine Configuration Schema",
-  "description": "Configuration schema for the options trading engine",
+  "required": [
+    "application",
+    "execution",
+    "database",
+    "cache",
+    "api",
+    "trading",
+    "constraints",
+    "scoring"
+  ],
   "properties": {
     "application": {
       "type": "object",
+      "required": ["name", "version", "environment"],
       "properties": {
-        "name": {
-          "type": "string",
-          "description": "Application name",
-          "default": "options-engine"
-        },
-        "version": {
-          "type": "string",
-          "description": "Application version",
-          "pattern": "^\\d+\\.\\d+\\.\\d+$"
-        },
-        "environment": {
-          "type": "string",
-          "enum": ["development", "staging", "production"],
-          "description": "Application environment"
-        },
-        "debug": {
-          "type": "boolean",
-          "description": "Enable debug mode",
-          "default": false
-        }
-      },
-      "required": ["name", "version", "environment"]
+        "name": {"type": "string"},
+        "version": {"type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$"},
+        "environment": {"type": "string", "enum": ["development", "staging", "production"]},
+        "debug": {"type": "boolean"},
+        "log_level": {"type": "string", "enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]}
+      }
     },
-    "api": {
+    "execution": {
       "type": "object",
+      "required": ["interval_minutes", "market_hours_only"],
       "properties": {
-        "tradier": {
-          "type": "object",
-          "properties": {
-            "base_url": {
-              "type": "string",
-              "format": "uri",
-              "description": "Tradier API base URL"
-            },
-            "timeout": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 300,
-              "description": "Request timeout in seconds",
-              "default": 30
-            },
-            "rate_limit": {
-              "type": "object",
-              "properties": {
-                "requests_per_minute": {
-                  "type": "integer",
-                  "minimum": 1,
-                  "description": "Max requests per minute"
-                },
-                "burst_size": {
-                  "type": "integer",
-                  "minimum": 1,
-                  "description": "Burst size for rate limiting"
-                }
-              },
-              "required": ["requests_per_minute"]
-            }
-          },
-          "required": ["base_url"]
-        },
-        "yahoo": {
-          "type": "object",
-          "properties": {
-            "base_url": {
-              "type": "string",
-              "format": "uri",
-              "description": "Yahoo Finance API base URL"
-            },
-            "timeout": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 300,
-              "description": "Request timeout in seconds",
-              "default": 30
-            }
-          },
-          "required": ["base_url"]
-        },
-        "fred": {
-          "type": "object",
-          "properties": {
-            "base_url": {
-              "type": "string",
-              "format": "uri",
-              "description": "FRED API base URL"
-            },
-            "timeout": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 300,
-              "description": "Request timeout in seconds",
-              "default": 30
-            }
-          },
-          "required": ["base_url"]
-        },
-        "quiver": {
-          "type": "object",
-          "properties": {
-            "base_url": {
-              "type": "string",
-              "format": "uri",
-              "description": "QuiverQuant API base URL"
-            },
-            "timeout": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 300,
-              "description": "Request timeout in seconds",
-              "default": 30
-            }
-          },
-          "required": ["base_url"]
-        }
-      },
-      "required": ["tradier", "yahoo", "fred", "quiver"]
+        "interval_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
+        "market_hours_only": {"type": "boolean"},
+        "max_concurrent_trades": {"type": "integer", "minimum": 1, "maximum": 100},
+        "max_portfolio_allocation": {"type": "number", "minimum": 0.01, "maximum": 0.10},
+        "emergency_stop_enabled": {"type": "boolean"}
+      }
+    },
+    "database": {
+      "type": "object",
+      "required": ["host", "port", "database", "user"],
+      "properties": {
+        "host": {"type": "string"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "database": {"type": "string"},
+        "user": {"type": "string"},
+        "password": {"type": "string"},
+        "pool_size": {"type": "integer", "minimum": 1, "maximum": 100},
+        "max_overflow": {"type": "integer", "minimum": 0, "maximum": 100},
+        "pool_timeout": {"type": "integer", "minimum": 1, "maximum": 300},
+        "pool_recycle": {"type": "integer", "minimum": 300, "maximum": 7200}
+      }
     },
     "cache": {
       "type": "object",
+      "required": ["redis_host", "redis_port", "redis_db"],
       "properties": {
-        "type": {
-          "type": "string",
-          "enum": ["memory", "redis", "null"],
-          "description": "Cache implementation type",
-          "default": "memory"
-        },
-        "default_ttl": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Default TTL in seconds",
-          "default": 3600
-        },
-        "max_size": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Maximum cache size",
-          "default": 10000
-        },
-        "redis": {
-          "type": "object",
-          "properties": {
-            "host": {
-              "type": "string",
-              "description": "Redis host"
-            },
-            "port": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 65535,
-              "description": "Redis port"
-            },
-            "db": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 15,
-              "description": "Redis database number"
-            },
-            "password": {
-              "type": "string",
-              "description": "Redis password"
-            }
-          },
-          "required": ["host", "port"]
-        }
-      },
-      "required": ["type"]
+        "redis_host": {"type": "string"},
+        "redis_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "redis_db": {"type": "integer", "minimum": 0, "maximum": 15},
+        "redis_password": {"type": "string"},
+        "default_ttl": {"type": "integer", "minimum": 60, "maximum": 3600},
+        "max_memory": {"type": "string", "pattern": "^\\d+[kmg]b$"},
+        "eviction_policy": {"type": "string", "enum": ["allkeys-lru", "allkeys-lfu", "volatile-lru", "volatile-lfu"]}
+      }
     },
-    "logging": {
+    "api": {
       "type": "object",
+      "required": ["tradier", "yahoo_finance", "fred", "quiver"],
       "properties": {
-        "level": {
-          "type": "string",
-          "enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-          "description": "Logging level",
-          "default": "INFO"
-        },
-        "format": {
-          "type": "string",
-          "description": "Log format string",
-          "default": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        },
-        "file": {
-          "type": "object",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Enable file logging",
-              "default": true
-            },
-            "path": {
-              "type": "string",
-              "description": "Log file path",
-              "default": "logs/options_engine.log"
-            },
-            "max_size": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Max log file size in MB",
-              "default": 10
-            },
-            "backup_count": {
-              "type": "integer",
-              "minimum": 0,
-              "description": "Number of backup files to keep",
-              "default": 5
-            }
-          }
-        },
-        "console": {
-          "type": "object",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Enable console logging",
-              "default": true
-            },
-            "colors": {
-              "type": "boolean",
-              "description": "Enable colored output",
-              "default": true
-            }
-          }
-        }
-      },
-      "required": ["level"]
+        "tradier": {"$ref": "#/definitions/api_client"},
+        "yahoo_finance": {"$ref": "#/definitions/api_client"},
+        "fred": {"$ref": "#/definitions/api_client"},
+        "quiver": {"$ref": "#/definitions/api_client"}
+      }
     },
     "trading": {
       "type": "object",
+      "required": ["nav", "available_capital", "strategies"],
       "properties": {
-        "constraints": {
-          "type": "object",
-          "properties": {
-            "min_probability_of_profit": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 1,
-              "description": "Minimum probability of profit",
-              "default": 0.65
-            },
-            "min_credit_to_max_loss": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 1,
-              "description": "Minimum credit to max loss ratio",
-              "default": 0.33
-            },
-            "max_loss_per_trade": {
-              "type": "number",
-              "minimum": 0,
-              "description": "Maximum loss per trade in dollars",
-              "default": 500
-            },
-            "max_quote_age_minutes": {
-              "type": "number",
-              "minimum": 0,
-              "description": "Maximum quote age in minutes",
-              "default": 10
-            },
-            "max_delta_exposure": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 1,
-              "description": "Maximum delta exposure as fraction of NAV",
-              "default": 0.30
-            },
-            "min_vega_exposure": {
-              "type": "number",
-              "maximum": 0,
-              "description": "Minimum vega exposure as fraction of NAV",
-              "default": -0.05
-            },
-            "max_trades_per_sector": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Maximum trades per sector",
-              "default": 2
-            },
-            "min_days_to_expiration": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Minimum days to expiration",
-              "default": 7
-            },
-            "max_days_to_expiration": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Maximum days to expiration",
-              "default": 45
-            }
-          }
+        "nav": {"type": "number", "minimum": 10000},
+        "available_capital": {"type": "number", "minimum": 1000},
+        "max_portfolio_allocation": {"type": "number", "minimum": 0.01, "maximum": 0.10},
+        "strategies": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD", "IRON_CONDOR", "COVERED_CALL", "CASH_SECURED_PUT"]
+          },
+          "minItems": 1
         },
-        "liquidity": {
+        "watchlist": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[A-Z]{1,5}$"},
+          "minItems": 1,
+          "maxItems": 50
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "required": ["hard"],
+      "properties": {
+        "hard": {
           "type": "object",
+          "required": ["min_pop", "min_credit_ratio", "min_dte", "max_dte"],
           "properties": {
-            "min_option_volume": {
-              "type": "integer",
-              "minimum": 0,
-              "description": "Minimum option volume",
-              "default": 10
-            },
-            "min_open_interest": {
-              "type": "integer",
-              "minimum": 0,
-              "description": "Minimum open interest",
-              "default": 100
-            },
-            "max_bid_ask_spread_pct": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 1,
-              "description": "Maximum bid-ask spread percentage",
-              "default": 0.50
-            }
-          }
-        },
-        "portfolio": {
-          "type": "object",
-          "properties": {
-            "default_nav": {
-              "type": "number",
-              "minimum": 0,
-              "description": "Default NAV in dollars",
-              "default": 100000
-            },
-            "max_capital_per_trade": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 1,
-              "description": "Maximum capital per trade as fraction of NAV",
-              "default": 0.05
-            }
+            "min_pop": {"type": "number", "minimum": 0.5, "maximum": 0.95},
+            "min_credit_ratio": {"type": "number", "minimum": 0.1, "maximum": 0.8},
+            "min_dte": {"type": "integer", "minimum": 1, "maximum": 60},
+            "max_dte": {"type": "integer", "minimum": 15, "maximum": 365},
+            "min_volume": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "min_open_interest": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "max_bid_ask_spread": {"type": "number", "minimum": 0.05, "maximum": 2.0},
+            "max_sector_allocation": {"type": "number", "minimum": 0.1, "maximum": 0.8},
+            "max_total_theta": {"type": "number", "maximum": 0},
+            "max_total_vega": {"type": "number", "minimum": 0, "maximum": 10000},
+            "max_total_delta": {"type": "number", "minimum": -1000, "maximum": 1000},
+            "max_net_liquidity": {"type": "number", "minimum": 10000, "maximum": 1000000},
+            "max_delta_long": {"type": "number", "minimum": 0.3, "maximum": 0.9},
+            "max_delta_short": {"type": "number", "minimum": -0.9, "maximum": -0.1},
+            "min_iv_rank": {"type": "number", "minimum": 0, "maximum": 100},
+            "max_iv_rank": {"type": "number", "minimum": 0, "maximum": 100},
+            "min_days_to_earnings": {"type": "integer", "minimum": 0, "maximum": 30},
+            "max_rsi": {"type": "number", "minimum": 50, "maximum": 100},
+            "min_rsi": {"type": "number", "minimum": 0, "maximum": 50},
+            "momentum_z_threshold": {"type": "number", "minimum": 0, "maximum": 5},
+            "flow_z_threshold": {"type": "number", "minimum": 0, "maximum": 5}
           }
         }
-      },
-      "required": ["constraints", "liquidity", "portfolio"]
+      }
     },
-    "data": {
+    "scoring": {
+      "type": "object",
+      "required": ["weights"],
+      "properties": {
+        "weights": {
+          "type": "object",
+          "required": ["pop", "iv_rank", "momentum", "flow", "risk_reward", "liquidity"],
+          "properties": {
+            "pop": {"type": "number", "minimum": 0, "maximum": 1},
+            "iv_rank": {"type": "number", "minimum": 0, "maximum": 1},
+            "momentum": {"type": "number", "minimum": 0, "maximum": 1},
+            "flow": {"type": "number", "minimum": 0, "maximum": 1},
+            "risk_reward": {"type": "number", "minimum": 0, "maximum": 1},
+            "liquidity": {"type": "number", "minimum": 0, "maximum": 1}
+          }
+        },
+        "regime_adjustments": {
+          "type": "object",
+          "properties": {
+            "high_volatility": {"$ref": "#/definitions/scoring_weights"},
+            "low_volatility": {"$ref": "#/definitions/scoring_weights"}
+          }
+        }
+      }
+    },
+    "performance": {
       "type": "object",
       "properties": {
-        "refresh_intervals": {
-          "type": "object",
-          "properties": {
-            "options_chains": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Options chain refresh interval in seconds",
-              "default": 300
-            },
-            "market_data": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Market data refresh interval in seconds",
-              "default": 60
-            },
-            "fundamentals": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Fundamentals refresh interval in seconds",
-              "default": 3600
-            },
-            "economic_data": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Economic data refresh interval in seconds",
-              "default": 86400
-            }
-          }
-        },
-        "symbols": {
-          "type": "object",
-          "properties": {
-            "broad_market": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "^[A-Z]{1,5}$"
-              },
-              "description": "Broad market symbols to scan",
-              "default": ["SPY", "QQQ", "IWM", "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA"]
-            },
-            "etf_flows": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "^[A-Z]{1,5}$"
-              },
-              "description": "ETF symbols for flow analysis",
-              "default": ["SPY", "QQQ", "IWM", "XLF", "XLK", "XLE", "XLI", "XLV", "XLY", "XLP"]
-            }
-          }
-        }
-      },
-      "required": ["refresh_intervals", "symbols"]
+        "thread_pool_size": {"type": "integer", "minimum": 1, "maximum": 64},
+        "max_workers": {"type": "integer", "minimum": 1, "maximum": 128},
+        "batch_size": {"type": "integer", "minimum": 10, "maximum": 1000},
+        "parallel_processing": {"type": "boolean"},
+        "memory_limit": {"type": "string", "pattern": "^\\d+[kmg]b$"},
+        "cpu_limit": {"type": "number", "minimum": 10, "maximum": 100},
+        "optimization_level": {"type": "string", "enum": ["conservative", "balanced", "aggressive"]}
+      }
     },
     "monitoring": {
       "type": "object",
       "properties": {
-        "metrics": {
+        "enabled": {"type": "boolean"},
+        "interval": {"type": "integer", "minimum": 30, "maximum": 3600},
+        "metrics_port": {"type": "integer", "minimum": 1024, "maximum": 65535},
+        "health_check_enabled": {"type": "boolean"},
+        "thresholds": {
           "type": "object",
           "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Enable metrics collection",
-              "default": true
-            },
-            "collection_interval": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Metrics collection interval in seconds",
-              "default": 60
-            }
-          }
-        },
-        "alerts": {
-          "type": "object",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Enable alerting",
-              "default": false
-            },
-            "thresholds": {
-              "type": "object",
-              "properties": {
-                "api_error_rate": {
-                  "type": "number",
-                  "minimum": 0,
-                  "maximum": 1,
-                  "description": "API error rate threshold",
-                  "default": 0.05
-                },
-                "processing_time": {
-                  "type": "number",
-                  "minimum": 0,
-                  "description": "Processing time threshold in seconds",
-                  "default": 30
-                }
-              }
-            }
+            "cpu_usage_warning": {"type": "number", "minimum": 50, "maximum": 95},
+            "cpu_usage_critical": {"type": "number", "minimum": 80, "maximum": 100},
+            "memory_usage_warning": {"type": "number", "minimum": 50, "maximum": 95},
+            "memory_usage_critical": {"type": "number", "minimum": 80, "maximum": 100},
+            "disk_usage_warning": {"type": "number", "minimum": 50, "maximum": 95},
+            "disk_usage_critical": {"type": "number", "minimum": 80, "maximum": 100},
+            "api_response_time_warning": {"type": "number", "minimum": 1, "maximum": 30},
+            "api_response_time_critical": {"type": "number", "minimum": 5, "maximum": 60},
+            "error_rate_warning": {"type": "number", "minimum": 1, "maximum": 20},
+            "error_rate_critical": {"type": "number", "minimum": 5, "maximum": 50}
           }
         }
-      },
-      "required": ["metrics"]
+      }
+    },
+    "alerts": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "smtp_server": {"type": "string"},
+            "smtp_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "use_tls": {"type": "boolean"},
+            "from_email": {"type": "string", "format": "email"},
+            "to_emails": {
+              "type": "array",
+              "items": {"type": "string", "format": "email"},
+              "minItems": 1
+            },
+            "username": {"type": "string"},
+            "password": {"type": "string"}
+          }
+        },
+        "slack": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "webhook_url": {"type": "string", "format": "uri"},
+            "channel": {"type": "string", "pattern": "^#[a-z0-9-_]+$"},
+            "username": {"type": "string"}
+          }
+        }
+      }
+    },
+    "logging": {
+      "type": "object",
+      "properties": {
+        "level": {"type": "string", "enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]},
+        "format": {"type": "string"},
+        "file": {"type": "string"},
+        "max_size": {"type": "string", "pattern": "^\\d+[KMG]B$"},
+        "backup_count": {"type": "integer", "minimum": 1, "maximum": 10},
+        "rotation": {"type": "string", "enum": ["daily", "weekly", "monthly", "size"]}
+      }
+    },
+    "error_handling": {
+      "type": "object",
+      "properties": {
+        "max_retries": {"type": "integer", "minimum": 0, "maximum": 10},
+        "retry_delay": {"type": "number", "minimum": 0.1, "maximum": 60},
+        "exponential_backoff": {"type": "boolean"},
+        "circuit_breaker_enabled": {"type": "boolean"},
+        "circuit_breaker_threshold": {"type": "integer", "minimum": 1, "maximum": 20},
+        "circuit_breaker_timeout": {"type": "integer", "minimum": 30, "maximum": 300},
+        "graceful_degradation": {"type": "boolean"}
+      }
+    },
+    "risk_management": {
+      "type": "object",
+      "properties": {
+        "max_drawdown": {"type": "number", "minimum": 0.01, "maximum": 0.5},
+        "max_correlation": {"type": "number", "minimum": 0.1, "maximum": 0.9},
+        "stress_testing_enabled": {"type": "boolean"},
+        "var_confidence_level": {"type": "number", "minimum": 0.9, "maximum": 0.99},
+        "expected_shortfall_enabled": {"type": "boolean"},
+        "dynamic_hedging_enabled": {"type": "boolean"}
+      }
     }
   },
-  "required": ["application", "api", "cache", "logging", "trading", "data", "monitoring"]
+  "definitions": {
+    "api_client": {
+      "type": "object",
+      "required": ["base_url", "rate_limit", "timeout"],
+      "properties": {
+        "base_url": {"type": "string", "format": "uri"},
+        "rate_limit": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "timeout": {"type": "integer", "minimum": 5, "maximum": 300},
+        "retries": {"type": "integer", "minimum": 0, "maximum": 10},
+        "backoff_factor": {"type": "number", "minimum": 1, "maximum": 10}
+      }
+    },
+    "scoring_weights": {
+      "type": "object",
+      "properties": {
+        "pop": {"type": "number", "minimum": 0, "maximum": 1},
+        "iv_rank": {"type": "number", "minimum": 0, "maximum": 1},
+        "momentum": {"type": "number", "minimum": 0, "maximum": 1},
+        "flow": {"type": "number", "minimum": 0, "maximum": 1},
+        "risk_reward": {"type": "number", "minimum": 0, "maximum": 1},
+        "liquidity": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    }
+  }
 }

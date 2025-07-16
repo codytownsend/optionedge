@@ -1,327 +1,293 @@
 """
-FRED (Federal Reserve Economic Data) API client for macroeconomic indicators.
+FRED (Federal Reserve Economic Data) API client for economic indicators.
 """
 
-import logging
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 from typing import Dict, Any, Optional, List
 
-from .base_client import BaseAPIClient, APIError
+from .base_client import BaseAPIClient, RateLimitConfig, CircuitBreakerConfig
 from ...data.models.market_data import EconomicIndicator
-
-logger = logging.getLogger(__name__)
 
 
 class FREDClient(BaseAPIClient):
-    """FRED API client for economic data."""
+    """
+    FRED API client implementation.
     
-    # Common economic indicators
-    ECONOMIC_SERIES = {
-        'GDP': 'GDP',
-        'CPI': 'CPIAUCSL',
-        'UNEMPLOYMENT': 'UNRATE',
-        'FEDERAL_FUNDS_RATE': 'FEDFUNDS',
-        'TEN_YEAR_TREASURY': 'GS10',
-        'RETAIL_SALES': 'RSXFS',
-        'INDUSTRIAL_PRODUCTION': 'INDPRO',
-        'HOUSING_STARTS': 'HOUST',
-        'CONSUMER_SENTIMENT': 'UMCSENT',
-        'INFLATION_EXPECTATIONS': 'T5YIE'
-    }
+    API Documentation: https://fred.stlouisfed.org/docs/api/fred/
+    Base URL: https://api.stlouisfed.org/fred/
+    Authentication: API key parameter
+    Rate Limit: 120 requests/minute
+    """
     
-    def __init__(self, 
-                 api_key: str,
-                 **kwargs):
-        """
-        Initialize FRED client.
+    def __init__(self, api_key: str):
+        rate_limit_config = RateLimitConfig(
+            requests_per_minute=120,
+            requests_per_hour=None,
+            burst_allowance=10
+        )
         
-        Args:
-            api_key: FRED API key
-            **kwargs: Additional arguments for base client
-        """
+        circuit_breaker_config = CircuitBreakerConfig(
+            failure_threshold=5,
+            timeout_seconds=60,
+            half_open_max_calls=3
+        )
+        
         super().__init__(
             base_url="https://api.stlouisfed.org/fred",
             api_key=api_key,
-            rate_limit_per_minute=120,  # FRED rate limit
-            **kwargs
+            rate_limit_config=rate_limit_config,
+            circuit_breaker_config=circuit_breaker_config,
+            timeout=30,
+            max_retries=3
         )
     
-    def _get_default_headers(self) -> Dict[str, str]:
-        """Get default headers for FRED API."""
+    def authenticate(self) -> Dict[str, str]:
+        """Return headers for FRED API (API key in URL params)."""
         return {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
+            "Accept": "application/json",
+            "User-Agent": "OptionsEngine/1.0"
         }
     
-    def _validate_response(self, response) -> bool:
-        """Validate FRED API response."""
+    def get_provider_name(self) -> str:
+        """Return the name of the data provider."""
+        return "FRED"
+    
+    def health_check(self) -> bool:
+        """Perform health check using series info endpoint."""
         try:
-            data = response.json()
-            
-            # Check for FRED API errors
-            if 'error_code' in data:
-                logger.error(f"FRED API error {data['error_code']}: {data.get('error_message', 'Unknown error')}")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Response validation failed: {e}")
+            # Try to get info for GDP series
+            response = self.get("series", params={
+                "series_id": "GDP",
+                "api_key": self.api_key,
+                "file_type": "json"
+            })
+            return "seriess" in response
+        except Exception:
             return False
     
-    def get_series_data(self, 
-                       series_id: str,
-                       start_date: Optional[date] = None,
-                       end_date: Optional[date] = None,
-                       limit: int = 1000) -> List[EconomicIndicator]:
+    def get_series_observations(
+        self, 
+        series_id: str,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        limit: int = 100
+    ) -> List[EconomicIndicator]:
         """
-        Get time series data for an economic indicator.
+        Get observations for a FRED data series.
         
         Args:
-            series_id: FRED series ID
-            start_date: Start date for data
-            end_date: End date for data
-            limit: Maximum number of observations
+            series_id: FRED series ID (e.g., 'GDP', 'UNRATE', 'FEDFUNDS')
+            start_date: Start date for observations
+            end_date: End date for observations
+            limit: Maximum number of observations to return
             
         Returns:
             List of EconomicIndicator objects
         """
-        params = {
-            'series_id': series_id,
-            'api_key': self.api_key,
-            'file_type': 'json',
-            'limit': limit
-        }
-        
-        if start_date:
-            params['observation_start'] = start_date.strftime('%Y-%m-%d')
-        
-        if end_date:
-            params['observation_end'] = end_date.strftime('%Y-%m-%d')
-        
         try:
-            response_data = self.get('/series/observations', params=params)
-            return self._parse_series_data(series_id, response_data)
+            params = {
+                "series_id": series_id,
+                "api_key": self.api_key,
+                "file_type": "json",
+                "limit": str(limit),
+                "sort_order": "desc"  # Get most recent first
+            }
             
-        except Exception as e:
-            logger.error(f"Failed to get series data for {series_id}: {e}")
-            return []
-    
-    def get_latest_value(self, series_id: str) -> Optional[EconomicIndicator]:
-        """
-        Get the latest value for an economic indicator.
-        
-        Args:
-            series_id: FRED series ID
+            if start_date:
+                params["observation_start"] = start_date.strftime("%Y-%m-%d")
+            if end_date:
+                params["observation_end"] = end_date.strftime("%Y-%m-%d")
             
-        Returns:
-            Latest EconomicIndicator or None
-        """
-        # Get last 1 observation
-        data = self.get_series_data(series_id, limit=1)
-        return data[0] if data else None
-    
-    def get_series_info(self, series_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get metadata about a series.
-        
-        Args:
-            series_id: FRED series ID
+            response = self.get("series/observations", params=params)
             
-        Returns:
-            Series metadata dictionary
-        """
-        params = {
-            'series_id': series_id,
-            'api_key': self.api_key,
-            'file_type': 'json'
-        }
-        
-        try:
-            response_data = self.get('/series', params=params)
-            return self._parse_series_info(response_data)
+            if "observations" not in response:
+                self.logger.warning(f"No observations found for series {series_id}")
+                return []
             
-        except Exception as e:
-            logger.error(f"Failed to get series info for {series_id}: {e}")
-            return None
-    
-    def get_economic_snapshot(self) -> Dict[str, Optional[EconomicIndicator]]:
-        """
-        Get latest values for key economic indicators.
-        
-        Returns:
-            Dictionary of indicator names to latest values
-        """
-        snapshot = {}
-        
-        for name, series_id in self.ECONOMIC_SERIES.items():
-            try:
-                latest = self.get_latest_value(series_id)
-                snapshot[name] = latest
-            except Exception as e:
-                logger.warning(f"Failed to get {name} ({series_id}): {e}")
-                snapshot[name] = None
-        
-        return snapshot
-    
-    def search_series(self, search_text: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """
-        Search for economic data series.
-        
-        Args:
-            search_text: Text to search for
-            limit: Maximum number of results
+            # Get series metadata for name and units
+            series_info = self.get_series_info(series_id)
+            series_name = series_info.get("title", series_id) if series_info else series_id
+            series_units = series_info.get("units", "") if series_info else ""
+            frequency = series_info.get("frequency", "") if series_info else ""
             
-        Returns:
-            List of series information
-        """
-        params = {
-            'search_text': search_text,
-            'api_key': self.api_key,
-            'file_type': 'json',
-            'limit': limit
-        }
-        
-        try:
-            response_data = self.get('/series/search', params=params)
-            return self._parse_search_results(response_data)
+            indicators = []
+            observations = response["observations"]
             
-        except Exception as e:
-            logger.error(f"Failed to search series for '{search_text}': {e}")
-            return []
-    
-    def _parse_series_data(self, series_id: str, data: Dict) -> List[EconomicIndicator]:
-        """Parse FRED series observations."""
-        indicators = []
-        
-        try:
-            if 'observations' not in data:
-                return indicators
+            # Sort by date to calculate changes
+            observations.sort(key=lambda x: x["date"])
             
-            observations = data['observations']
-            if not isinstance(observations, list):
-                return indicators
-            
-            # Get series info for metadata
-            series_info = self.get_series_info(series_id) or {}
-            series_title = series_info.get('title', series_id)
-            series_units = series_info.get('units', '')
-            frequency = series_info.get('frequency', 'Unknown')
-            
-            for obs in observations:
+            for i, obs in enumerate(observations):
+                if obs["value"] == ".":  # FRED uses "." for missing values
+                    continue
+                
                 try:
-                    # Parse date
-                    obs_date = datetime.strptime(obs['date'], '%Y-%m-%d').date()
-                    
-                    # Parse value (skip if missing or '.')
-                    value_str = obs.get('value', '.')
-                    if value_str == '.' or value_str is None:
-                        continue
-                    
-                    value = Decimal(str(value_str))
-                    
                     indicator = EconomicIndicator(
                         indicator_id=series_id,
-                        name=series_title,
-                        value=value,
-                        date=obs_date,
-                        frequency=frequency.lower(),
+                        name=series_name,
+                        value=Decimal(obs["value"]),
+                        date=datetime.strptime(obs["date"], "%Y-%m-%d").date(),
+                        frequency=frequency,
                         units=series_units,
-                        source='FRED'
+                        source="FRED"
                     )
+                    
+                    # Calculate change metrics if we have previous value
+                    if i > 0 and observations[i-1]["value"] != ".":
+                        prev_value = Decimal(observations[i-1]["value"])
+                        indicator.calculate_change_metrics(prev_value)
                     
                     indicators.append(indicator)
                     
-                except Exception as e:
-                    logger.warning(f"Failed to parse observation: {e}")
+                except (ValueError, TypeError) as e:
+                    self.logger.warning(f"Invalid observation value for {series_id}: {obs}")
                     continue
-            
-            # Sort by date and calculate period-over-period changes
-            indicators.sort(key=lambda x: x.date)
-            
-            for i in range(1, len(indicators)):
-                current = indicators[i]
-                previous = indicators[i-1]
-                
-                # Calculate change
-                change = current.value - previous.value
-                change_percent = float(change / previous.value * 100) if previous.value != 0 else None
-                
-                # Update current indicator with change data
-                indicators[i] = current.copy(update={
-                    'previous_value': previous.value,
-                    'change': change,
-                    'change_percent': change_percent
-                })
             
             return indicators
             
         except Exception as e:
-            logger.warning(f"Failed to parse series data: {e}")
-            return indicators
+            self.logger.error(f"Failed to get observations for series {series_id}: {str(e)}")
+            return []
     
-    def _parse_series_info(self, data: Dict) -> Optional[Dict[str, Any]]:
-        """Parse FRED series metadata."""
+    def get_series_info(self, series_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get metadata information for a FRED data series.
+        
+        Args:
+            series_id: FRED series ID
+            
+        Returns:
+            Dictionary with series metadata or None
+        """
         try:
-            if 'seriess' not in data or not data['seriess']:
+            params = {
+                "series_id": series_id,
+                "api_key": self.api_key,
+                "file_type": "json"
+            }
+            
+            response = self.get("series", params=params)
+            
+            if "seriess" not in response or not response["seriess"]:
                 return None
             
-            series = data['seriess'][0]  # Take first series
-            
+            series_data = response["seriess"][0]
             return {
-                'id': series.get('id', ''),
-                'title': series.get('title', ''),
-                'observation_start': series.get('observation_start', ''),
-                'observation_end': series.get('observation_end', ''),
-                'frequency': series.get('frequency', ''),
-                'frequency_short': series.get('frequency_short', ''),
-                'units': series.get('units', ''),
-                'units_short': series.get('units_short', ''),
-                'seasonal_adjustment': series.get('seasonal_adjustment', ''),
-                'seasonal_adjustment_short': series.get('seasonal_adjustment_short', ''),
-                'last_updated': series.get('last_updated', ''),
-                'popularity': series.get('popularity', 0),
-                'notes': series.get('notes', '')
+                "id": series_data.get("id"),
+                "title": series_data.get("title"),
+                "units": series_data.get("units"),
+                "frequency": series_data.get("frequency"),
+                "observation_start": series_data.get("observation_start"),
+                "observation_end": series_data.get("observation_end"),
+                "last_updated": series_data.get("last_updated"),
+                "notes": series_data.get("notes")
             }
             
         except Exception as e:
-            logger.warning(f"Failed to parse series info: {e}")
+            self.logger.error(f"Failed to get series info for {series_id}: {str(e)}")
             return None
     
-    def _parse_search_results(self, data: Dict) -> List[Dict[str, Any]]:
-        """Parse FRED series search results."""
-        results = []
+    def get_latest_observation(self, series_id: str) -> Optional[EconomicIndicator]:
+        """
+        Get the most recent observation for a FRED data series.
         
-        try:
-            if 'seriess' not in data:
-                return results
+        Args:
+            series_id: FRED series ID
             
-            for series in data['seriess']:
-                result = {
-                    'id': series.get('id', ''),
-                    'title': series.get('title', ''),
-                    'units': series.get('units', ''),
-                    'frequency': series.get('frequency', ''),
-                    'observation_start': series.get('observation_start', ''),
-                    'observation_end': series.get('observation_end', ''),
-                    'popularity': series.get('popularity', 0),
-                    'last_updated': series.get('last_updated', '')
-                }
-                results.append(result)
-            
-            return results
-            
-        except Exception as e:
-            logger.warning(f"Failed to parse search results: {e}")
-            return results
+        Returns:
+            EconomicIndicator object or None
+        """
+        observations = self.get_series_observations(series_id, limit=2)  # Get 2 to calculate change
+        return observations[0] if observations else None
     
-    def test_connection(self) -> bool:
-        """Test FRED API connection."""
+    def get_multiple_series_latest(self, series_ids: List[str]) -> Dict[str, EconomicIndicator]:
+        """
+        Get latest observations for multiple FRED data series.
+        
+        Args:
+            series_ids: List of FRED series IDs
+            
+        Returns:
+            Dictionary mapping series IDs to EconomicIndicator objects
+        """
+        results = {}
+        
+        for series_id in series_ids:
+            try:
+                latest = self.get_latest_observation(series_id)
+                if latest:
+                    results[series_id] = latest
+            except Exception as e:
+                self.logger.error(f"Failed to get latest observation for {series_id}: {str(e)}")
+                continue
+        
+        return results
+    
+    def search_series(self, search_text: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        Search for FRED data series by text.
+        
+        Args:
+            search_text: Search terms
+            limit: Maximum number of results
+            
+        Returns:
+            List of series metadata dictionaries
+        """
         try:
-            # Test with GDP series
-            gdp_info = self.get_series_info('GDP')
-            return gdp_info is not None
+            params = {
+                "search_text": search_text,
+                "api_key": self.api_key,
+                "file_type": "json",
+                "limit": str(limit)
+            }
+            
+            response = self.get("series/search", params=params)
+            
+            if "seriess" not in response:
+                return []
+            
+            series_list = []
+            for series in response["seriess"]:
+                series_list.append({
+                    "id": series.get("id"),
+                    "title": series.get("title"),
+                    "units": series.get("units"),
+                    "frequency": series.get("frequency"),
+                    "popularity": series.get("popularity"),
+                    "observation_start": series.get("observation_start"),
+                    "observation_end": series.get("observation_end")
+                })
+            
+            return series_list
+            
         except Exception as e:
-            logger.error(f"FRED connection test failed: {e}")
-            return False
+            self.logger.error(f"Failed to search series with text '{search_text}': {str(e)}")
+            return []
+    
+    def get_economic_indicators_summary(self) -> Dict[str, EconomicIndicator]:
+        """
+        Get a summary of key economic indicators.
+        
+        Returns:
+            Dictionary mapping indicator names to EconomicIndicator objects
+        """
+        key_indicators = {
+            "GDP": "GDP",
+            "UNEMPLOYMENT": "UNRATE", 
+            "INFLATION": "CPIAUCSL",
+            "FED_FUNDS": "FEDFUNDS",
+            "10Y_TREASURY": "GS10",
+            "VIX": "VIXCLS",
+            "SP500": "SP500",
+            "DOLLAR_INDEX": "DEXUSEU"
+        }
+        
+        results = {}
+        series_data = self.get_multiple_series_latest(list(key_indicators.values()))
+        
+        for name, series_id in key_indicators.items():
+            if series_id in series_data:
+                results[name] = series_data[series_id]
+        
+        return results

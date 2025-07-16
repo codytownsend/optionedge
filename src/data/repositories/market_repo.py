@@ -1,192 +1,160 @@
 """
-Market data repository for managing stock quotes, fundamentals, and technical indicators.
+Market data repository for the Options Trading Engine.
 """
 
-from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any
-from decimal import Decimal
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+import logging
 
-from .base import BaseRepository, RepositoryError, DataNotFoundError
-from ..models.market_data import (
-    StockQuote, FundamentalData, TechnicalIndicators, 
-    EconomicIndicator, SentimentData, ETFFlowData, OHLCVData
-)
-from ...infrastructure.api.yahoo_client import YahooFinanceClient
-from ...infrastructure.api.fred_client import FREDClient
-from ...infrastructure.cache.base_cache import CacheInterface
+from .base import BaseRepository
+from ..models.market_data import MarketData, TechnicalIndicators
+from ...infrastructure.api import TradierClient, YahooClient, FredClient, QuiverClient
+from ...infrastructure.error_handling import RepositoryError, DataError
+from ...infrastructure.cache import CacheManager
+
+logger = logging.getLogger(__name__)
 
 
-class MarketDataRepository(BaseRepository[StockQuote]):
-    """Repository for market data with multiple data source integration."""
+class MarketDataRepository(BaseRepository[MarketData]):
+    """
+    Repository for market data operations.
     
-    def __init__(self,
-                 yahoo_client: YahooFinanceClient,
-                 fred_client: Optional[FREDClient] = None,
-                 cache: Optional[CacheInterface] = None,
-                 cache_ttl_seconds: int = 300):
-        """
-        Initialize market data repository.
-        
-        Args:
-            yahoo_client: Yahoo Finance API client
-            fred_client: FRED API client for economic data
-            cache: Cache implementation
-            cache_ttl_seconds: Cache TTL in seconds
-        """
-        super().__init__(cache_ttl_seconds)
+    Handles market data retrieval, caching, and validation from multiple sources.
+    """
+    
+    def __init__(self, 
+                 tradier_client: TradierClient,
+                 yahoo_client: YahooClient,
+                 fred_client: FredClient,
+                 quiver_client: QuiverClient,
+                 cache_manager: Optional[CacheManager] = None):
+        super().__init__(cache_manager)
+        self.tradier_client = tradier_client
         self.yahoo_client = yahoo_client
         self.fred_client = fred_client
-        self.cache = cache
+        self.quiver_client = quiver_client
     
-    def get_by_id(self, entity_id: str) -> Optional[StockQuote]:
-        """Get stock quote by symbol."""
-        return self.get_stock_quote(entity_id)
+    def get_by_id(self, id: str) -> Optional[MarketData]:
+        """Get market data by symbol."""
+        return self.get_market_data(id)
     
-    def get_all(self, filters: Optional[Dict[str, Any]] = None) -> List[StockQuote]:
-        """Get stock quotes for multiple symbols."""
-        if not filters or 'symbols' not in filters:
-            raise ValueError("Must provide 'symbols' filter for get_all")
+    def create(self, entity: MarketData) -> MarketData:
+        """Create is not supported for market data."""
+        raise NotImplementedError("Market data creation not supported")
+    
+    def update(self, entity: MarketData) -> MarketData:
+        """Update is not supported for market data."""
+        raise NotImplementedError("Market data update not supported")
+    
+    def delete(self, id: str) -> bool:
+        """Delete market data from cache."""
+        cache_key = self._get_cache_key("market_data", id)
+        self._invalidate_cache(cache_key)
+        return True
+    
+    def find_all(self, filters: Optional[Dict[str, Any]] = None) -> List[MarketData]:
+        """Find all market data matching filters."""
+        symbols = filters.get('symbols', []) if filters else []
+        if not symbols:
+            return []
         
-        symbols = filters['symbols']
-        quotes = []
-        
+        results = []
         for symbol in symbols:
-            try:
-                quote = self.get_stock_quote(symbol)
-                if quote:
-                    quotes.append(quote)
-            except Exception as e:
-                self.logger.warning(f"Failed to get quote for {symbol}: {e}")
-                continue
+            data = self.get_market_data(symbol)
+            if data:
+                results.append(data)
         
-        return quotes
+        return self._apply_filters(results, filters or {})
     
-    def save(self, entity: StockQuote) -> StockQuote:
-        """Save stock quote to cache."""
-        if not self.validate_entity(entity):
-            raise RepositoryError("Invalid stock quote entity")
-        
-        cache_key = f"stock_quote:{entity.symbol}"
-        
-        if self.cache:
-            self.cache.set(cache_key, entity, ttl=self.cache_ttl_seconds)
-        else:
-            self._set_cache(cache_key, entity)
-        
-        return entity
-    
-    def delete(self, entity_id: str) -> bool:
-        """Delete stock quote from cache."""
-        cache_key = f"stock_quote:{entity_id}"
-        
-        if self.cache:
-            return self.cache.delete(cache_key)
-        else:
-            if cache_key in self._cache:
-                del self._cache[cache_key]
-                return True
-            return False
-    
-    def get_stock_quote(self, 
-                       symbol: str,
-                       force_refresh: bool = False) -> Optional[StockQuote]:
+    def get_market_data(self, symbol: str, force_refresh: bool = False) -> Optional[MarketData]:
         """
-        Get real-time stock quote.
+        Get comprehensive market data for a symbol.
         
         Args:
             symbol: Stock symbol
-            force_refresh: Force API call even if cached
+            force_refresh: Force refresh from API
             
         Returns:
-            StockQuote object or None if not found
+            MarketData object or None if not found
         """
-        cache_key = f"stock_quote:{symbol}"
-        
-        # Check cache first (unless force refresh)
-        if not force_refresh:
-            cached_quote = self._get_from_cache(cache_key)
-            if cached_quote:
-                return cached_quote
-            
-            if self.cache:
-                cached_quote = self.cache.get(cache_key)
-                if cached_quote:
-                    return cached_quote
-        
-        # Fetch from API
-        try:
-            # Try Yahoo Finance first
-            stock_info = self.yahoo_client.get_stock_info(symbol)
-            if stock_info:
-                quote = self._parse_yahoo_quote(symbol, stock_info)
-                if quote:
-                    # Cache the result
-                    self._set_cache(cache_key, quote)
-                    if self.cache:
-                        self.cache.set(cache_key, quote, ttl=self.cache_ttl_seconds)
-                    
-                    self.logger.debug(f"Retrieved stock quote for {symbol}")
-                    return quote
-            
-            self.logger.warning(f"No stock quote found for {symbol}")
-            return None
-            
-        except Exception as e:
-            self._handle_error(f"get_stock_quote({symbol})", e)
-            return None
-    
-    def get_fundamental_data(self, 
-                           symbol: str,
-                           force_refresh: bool = False) -> Optional[FundamentalData]:
-        """
-        Get fundamental financial data.
-        
-        Args:
-            symbol: Stock symbol
-            force_refresh: Force API call even if cached
-            
-        Returns:
-            FundamentalData object or None if not found
-        """
-        cache_key = f"fundamentals:{symbol}"
+        cache_key = self._get_cache_key("market_data", symbol)
         
         # Check cache first
         if not force_refresh:
             cached_data = self._get_from_cache(cache_key)
-            if cached_data:
+            if cached_data and self._is_data_fresh(cached_data.timestamp, 15):
                 return cached_data
-            
-            if self.cache:
-                cached_data = self.cache.get(cache_key)
-                if cached_data:
-                    return cached_data
         
-        # Fetch from API
         try:
-            fundamental_data = self.yahoo_client.get_fundamental_data(symbol)
+            # Get real-time quote
+            quote_data = self.tradier_client.get_quote(symbol)
+            if not quote_data:
+                self.logger.warning(f"No quote data found for {symbol}")
+                return None
             
-            if fundamental_data:
-                # Cache with longer TTL since fundamentals change less frequently
-                longer_ttl = self.cache_ttl_seconds * 4  # 20 minutes default
-                self._set_cache(cache_key, fundamental_data)
-                if self.cache:
-                    self.cache.set(cache_key, fundamental_data, ttl=longer_ttl)
-                
-                self.logger.debug(f"Retrieved fundamental data for {symbol}")
-                return fundamental_data
+            # Get historical data
+            historical_data = self.yahoo_client.get_historical_data(
+                symbol, 
+                period="1y"
+            )
             
-            return None
+            # Get technical indicators
+            technical_indicators = self._calculate_technical_indicators(
+                symbol, 
+                historical_data
+            )
+            
+            # Get fundamental data
+            fundamental_data = self._get_fundamental_data(symbol)
+            
+            # Get sentiment data
+            sentiment_data = self._get_sentiment_data(symbol)
+            
+            # Create market data object
+            market_data = MarketData(
+                symbol=symbol,
+                timestamp=self._get_timestamp(),
+                price=quote_data.get('last', 0.0),
+                volume=quote_data.get('volume', 0),
+                open_price=quote_data.get('open', 0.0),
+                high_price=quote_data.get('high', 0.0),
+                low_price=quote_data.get('low', 0.0),
+                close_price=quote_data.get('close', 0.0),
+                previous_close=quote_data.get('prevclose', 0.0),
+                change=quote_data.get('change', 0.0),
+                change_percentage=quote_data.get('change_percentage', 0.0),
+                bid=quote_data.get('bid', 0.0),
+                ask=quote_data.get('ask', 0.0),
+                bid_size=quote_data.get('bidsize', 0),
+                ask_size=quote_data.get('asksize', 0),
+                market_cap=fundamental_data.get('market_cap', 0),
+                pe_ratio=fundamental_data.get('pe_ratio', 0.0),
+                dividend_yield=fundamental_data.get('dividend_yield', 0.0),
+                beta=fundamental_data.get('beta', 0.0),
+                avg_volume=historical_data.get('avg_volume', 0) if historical_data else 0,
+                week_52_high=fundamental_data.get('week_52_high', 0.0),
+                week_52_low=fundamental_data.get('week_52_low', 0.0),
+                technical_indicators=technical_indicators,
+                sentiment_score=sentiment_data.get('sentiment_score', 0.0),
+                analyst_rating=sentiment_data.get('analyst_rating', 'HOLD'),
+                price_target=sentiment_data.get('price_target', 0.0)
+            )
+            
+            # Cache the result
+            self._set_to_cache(cache_key, market_data, ttl=900)  # 15 minutes
+            
+            return market_data
             
         except Exception as e:
-            self._handle_error(f"get_fundamental_data({symbol})", e)
+            self._handle_repository_error("get_market_data", e)
             return None
     
-    def get_historical_data(self,
-                          symbol: str,
+    def get_historical_data(self, 
+                          symbol: str, 
                           period: str = "1y",
-                          interval: str = "1d") -> List[OHLCVData]:
+                          interval: str = "1d") -> Optional[List[Dict[str, Any]]]:
         """
-        Get historical OHLCV data.
+        Get historical market data.
         
         Args:
             symbol: Stock symbol
@@ -194,262 +162,205 @@ class MarketDataRepository(BaseRepository[StockQuote]):
             interval: Data interval (1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)
             
         Returns:
-            List of OHLCV data points
+            List of historical data points
         """
-        cache_key = f"historical:{symbol}:{period}:{interval}"
+        cache_key = self._get_cache_key("historical", symbol, period, interval)
         
-        # Check cache
+        # Check cache first
         cached_data = self._get_from_cache(cache_key)
-        if cached_data:
-            return cached_data
+        if cached_data and self._is_data_fresh(cached_data.get('timestamp'), 60):
+            return cached_data.get('data', [])
         
-        if self.cache:
-            cached_data = self.cache.get(cache_key)
-            if cached_data:
-                return cached_data
-        
-        # Fetch from API
         try:
-            historical_data = self.yahoo_client.get_historical_data(symbol, period, interval)
+            historical_data = self.yahoo_client.get_historical_data(
+                symbol, 
+                period=period,
+                interval=interval
+            )
             
             if historical_data:
-                # Cache with longer TTL for historical data
-                longer_ttl = self.cache_ttl_seconds * 12  # 1 hour default
-                self._set_cache(cache_key, historical_data)
-                if self.cache:
-                    self.cache.set(cache_key, historical_data, ttl=longer_ttl)
-                
-                self.logger.debug(f"Retrieved {len(historical_data)} historical data points for {symbol}")
+                cache_data = {
+                    'data': historical_data,
+                    'timestamp': self._get_timestamp()
+                }
+                self._set_to_cache(cache_key, cache_data, ttl=3600)  # 1 hour
                 return historical_data
             
             return []
             
         except Exception as e:
-            self._handle_error(f"get_historical_data({symbol})", e)
+            self._handle_repository_error("get_historical_data", e)
             return []
     
-    def get_technical_indicators(self, symbol: str) -> Optional[TechnicalIndicators]:
-        """Calculate technical indicators from historical data."""
-        cache_key = f"technicals:{symbol}"
-        
-        # Check cache
-        cached_indicators = self._get_from_cache(cache_key)
-        if cached_indicators:
-            return cached_indicators
-        
-        # Calculate from historical data
-        try:
-            # Get historical data for calculations
-            historical_data = self.get_historical_data(symbol, period="1y", interval="1d")
-            
-            if not historical_data:
-                return None
-            
-            # Calculate indicators (simplified implementation)
-            indicators = self._calculate_technical_indicators(symbol, historical_data)
-            
-            if indicators:
-                # Cache with medium TTL
-                medium_ttl = self.cache_ttl_seconds * 2  # 10 minutes default
-                self._set_cache(cache_key, indicators)
-                if self.cache:
-                    self.cache.set(cache_key, indicators, ttl=medium_ttl)
-                
-                return indicators
-            
-            return None
-            
-        except Exception as e:
-            self._handle_error(f"get_technical_indicators({symbol})", e)
-            return None
-    
-    def get_economic_indicator(self, 
-                             indicator_id: str,
-                             force_refresh: bool = False) -> Optional[EconomicIndicator]:
+    def get_economic_indicators(self, indicators: List[str]) -> Dict[str, Any]:
         """
-        Get economic indicator data.
+        Get economic indicators from FRED.
         
         Args:
-            indicator_id: FRED series ID
-            force_refresh: Force API call even if cached
+            indicators: List of FRED series IDs
             
         Returns:
-            Latest EconomicIndicator or None
+            Dictionary of indicator values
         """
-        if not self.fred_client:
-            self.logger.warning("FRED client not available for economic indicators")
-            return None
+        cache_key = self._get_cache_key("economic_indicators", *indicators)
         
-        cache_key = f"economic:{indicator_id}"
+        # Check cache first
+        cached_data = self._get_from_cache(cache_key)
+        if cached_data and self._is_data_fresh(cached_data.get('timestamp'), 1440):  # 24 hours
+            return cached_data.get('data', {})
         
-        # Check cache
-        if not force_refresh:
-            cached_indicator = self._get_from_cache(cache_key)
-            if cached_indicator:
-                return cached_indicator
-        
-        # Fetch from FRED API
         try:
-            indicator = self.fred_client.get_latest_value(indicator_id)
+            economic_data = {}
+            for indicator in indicators:
+                data = self.fred_client.get_series(indicator)
+                if data:
+                    economic_data[indicator] = data
             
-            if indicator:
-                # Cache with longer TTL since economic data updates less frequently
-                longer_ttl = self.cache_ttl_seconds * 24  # 2 hours default
-                self._set_cache(cache_key, indicator)
-                if self.cache:
-                    self.cache.set(cache_key, indicator, ttl=longer_ttl)
-                
-                self.logger.debug(f"Retrieved economic indicator {indicator_id}")
-                return indicator
-            
-            return None
-            
-        except Exception as e:
-            self._handle_error(f"get_economic_indicator({indicator_id})", e)
-            return None
-    
-    def get_economic_snapshot(self) -> Dict[str, Optional[EconomicIndicator]]:
-        """Get snapshot of key economic indicators."""
-        if not self.fred_client:
-            return {}
-        
-        cache_key = "economic_snapshot"
-        
-        # Check cache
-        cached_snapshot = self._get_from_cache(cache_key)
-        if cached_snapshot:
-            return cached_snapshot
-        
-        # Fetch from FRED
-        try:
-            snapshot = self.fred_client.get_economic_snapshot()
-            
-            if snapshot:
-                # Cache for longer since economic data doesn't change frequently
-                longer_ttl = self.cache_ttl_seconds * 24  # 2 hours default
-                self._set_cache(cache_key, snapshot)
-                if self.cache:
-                    self.cache.set(cache_key, snapshot, ttl=longer_ttl)
-                
-                self.logger.debug("Retrieved economic snapshot")
-                return snapshot
+            if economic_data:
+                cache_data = {
+                    'data': economic_data,
+                    'timestamp': self._get_timestamp()
+                }
+                self._set_to_cache(cache_key, cache_data, ttl=86400)  # 24 hours
+                return economic_data
             
             return {}
             
         except Exception as e:
-            self._handle_error("get_economic_snapshot", e)
+            self._handle_repository_error("get_economic_indicators", e)
             return {}
     
-    def _parse_yahoo_quote(self, symbol: str, stock_info: Dict[str, Any]) -> Optional[StockQuote]:
-        """Parse Yahoo Finance stock info into StockQuote."""
+    def get_market_sentiment(self, symbol: str) -> Dict[str, Any]:
+        """
+        Get market sentiment data.
+        
+        Args:
+            symbol: Stock symbol
+            
+        Returns:
+            Dictionary of sentiment metrics
+        """
+        cache_key = self._get_cache_key("sentiment", symbol)
+        
+        # Check cache first
+        cached_data = self._get_from_cache(cache_key)
+        if cached_data and self._is_data_fresh(cached_data.get('timestamp'), 60):
+            return cached_data.get('data', {})
+        
         try:
-            if not stock_info:
-                return None
+            sentiment_data = self.quiver_client.get_sentiment_data(symbol)
             
-            # Extract price data (Yahoo Finance API structure varies)
-            price = stock_info.get('regularMarketPrice') or stock_info.get('price')
+            if sentiment_data:
+                cache_data = {
+                    'data': sentiment_data,
+                    'timestamp': self._get_timestamp()
+                }
+                self._set_to_cache(cache_key, cache_data, ttl=3600)  # 1 hour
+                return sentiment_data
             
-            if not price:
-                return None
-            
-            quote = StockQuote(
-                symbol=symbol.upper(),
-                price=Decimal(str(price)),
-                bid=self._safe_decimal(stock_info.get('bid')),
-                ask=self._safe_decimal(stock_info.get('ask')),
-                open=self._safe_decimal(stock_info.get('regularMarketOpen')),
-                high=self._safe_decimal(stock_info.get('regularMarketDayHigh')),
-                low=self._safe_decimal(stock_info.get('regularMarketDayLow')),
-                previous_close=self._safe_decimal(stock_info.get('regularMarketPreviousClose')),
-                volume=self._safe_int(stock_info.get('regularMarketVolume')),
-                avg_volume=self._safe_int(stock_info.get('averageDailyVolume3Month')),
-                change=self._safe_decimal(stock_info.get('regularMarketChange')),
-                change_percent=self._safe_float(stock_info.get('regularMarketChangePercent')),
-                quote_time=datetime.utcnow(),
-                exchange=stock_info.get('exchange', 'YAHOO')
-            )
-            
-            return quote
+            return {}
             
         except Exception as e:
-            self.logger.warning(f"Failed to parse Yahoo quote for {symbol}: {e}")
-            return None
+            self._handle_repository_error("get_market_sentiment", e)
+            return {}
     
     def _calculate_technical_indicators(self, 
                                       symbol: str, 
-                                      historical_data: List[OHLCVData]) -> Optional[TechnicalIndicators]:
+                                      historical_data: Optional[List[Dict[str, Any]]]) -> Optional[TechnicalIndicators]:
         """Calculate technical indicators from historical data."""
+        if not historical_data:
+            return None
+        
         try:
-            if len(historical_data) < 200:  # Need enough data for 200-day MA
-                self.logger.warning(f"Insufficient historical data for {symbol}")
+            # Extract price data
+            closes = [float(data['close']) for data in historical_data]
+            volumes = [int(data['volume']) for data in historical_data]
+            
+            if len(closes) < 50:  # Need sufficient data for indicators
                 return None
             
-            # Sort by timestamp
-            sorted_data = sorted(historical_data, key=lambda x: x.timestamp)
-            
-            # Extract closing prices
-            closes = [float(bar.close) for bar in sorted_data]
-            
-            # Calculate simple moving averages
-            sma_20 = self._calculate_sma(closes, 20) if len(closes) >= 20 else None
-            sma_50 = self._calculate_sma(closes, 50) if len(closes) >= 50 else None
-            sma_100 = self._calculate_sma(closes, 100) if len(closes) >= 100 else None
-            sma_200 = self._calculate_sma(closes, 200) if len(closes) >= 200 else None
+            # Calculate moving averages
+            sma_20 = sum(closes[-20:]) / 20
+            sma_50 = sum(closes[-50:]) / 50
             
             # Calculate RSI
-            rsi_14 = self._calculate_rsi(closes, 14) if len(closes) >= 14 else None
+            rsi = self._calculate_rsi(closes)
             
-            # Calculate momentum
-            momentum_1d = (closes[-1] / closes[-2] - 1) * 100 if len(closes) >= 2 else None
-            momentum_5d = (closes[-1] / closes[-6] - 1) * 100 if len(closes) >= 6 else None
-            momentum_20d = (closes[-1] / closes[-21] - 1) * 100 if len(closes) >= 21 else None
+            # Calculate MACD
+            macd_line, signal_line, histogram = self._calculate_macd(closes)
             
-            # Calculate historical volatility
-            hv_30 = self._calculate_historical_volatility(closes, 30) if len(closes) >= 30 else None
+            # Calculate Bollinger Bands
+            bb_upper, bb_middle, bb_lower = self._calculate_bollinger_bands(closes)
             
-            indicators = TechnicalIndicators(
-                symbol=symbol.upper(),
-                timestamp=datetime.utcnow(),
-                sma_20=Decimal(str(sma_20)) if sma_20 else None,
-                sma_50=Decimal(str(sma_50)) if sma_50 else None,
-                sma_100=Decimal(str(sma_100)) if sma_100 else None,
-                sma_200=Decimal(str(sma_200)) if sma_200 else None,
-                rsi_14=rsi_14,
-                hv_30=hv_30,
-                momentum_1d=momentum_1d,
-                momentum_5d=momentum_5d,
-                momentum_20d=momentum_20d
+            # Calculate Average True Range
+            atr = self._calculate_atr(historical_data)
+            
+            # Calculate Volume indicators
+            volume_sma = sum(volumes[-20:]) / 20
+            
+            return TechnicalIndicators(
+                symbol=symbol,
+                timestamp=self._get_timestamp(),
+                sma_20=sma_20,
+                sma_50=sma_50,
+                ema_12=self._calculate_ema(closes, 12),
+                ema_26=self._calculate_ema(closes, 26),
+                rsi=rsi,
+                macd_line=macd_line,
+                macd_signal=signal_line,
+                macd_histogram=histogram,
+                bollinger_upper=bb_upper,
+                bollinger_middle=bb_middle,
+                bollinger_lower=bb_lower,
+                atr=atr,
+                volume_sma=volume_sma,
+                stochastic_k=self._calculate_stochastic_k(historical_data),
+                stochastic_d=self._calculate_stochastic_d(historical_data),
+                williams_r=self._calculate_williams_r(historical_data)
             )
             
-            return indicators
-            
         except Exception as e:
-            self.logger.warning(f"Failed to calculate technical indicators for {symbol}: {e}")
+            self.logger.warning(f"Technical indicator calculation failed for {symbol}: {e}")
             return None
     
-    def _calculate_sma(self, prices: List[float], period: int) -> Optional[float]:
-        """Calculate Simple Moving Average."""
-        if len(prices) < period:
-            return None
-        return sum(prices[-period:]) / period
+    def _get_fundamental_data(self, symbol: str) -> Dict[str, Any]:
+        """Get fundamental data for symbol."""
+        try:
+            return self.yahoo_client.get_fundamental_data(symbol) or {}
+        except Exception as e:
+            self.logger.warning(f"Fundamental data retrieval failed for {symbol}: {e}")
+            return {}
     
-    def _calculate_rsi(self, prices: List[float], period: int = 14) -> Optional[float]:
-        """Calculate Relative Strength Index."""
-        if len(prices) <= period:
-            return None
+    def _get_sentiment_data(self, symbol: str) -> Dict[str, Any]:
+        """Get sentiment data for symbol."""
+        try:
+            return self.quiver_client.get_sentiment_data(symbol) or {}
+        except Exception as e:
+            self.logger.warning(f"Sentiment data retrieval failed for {symbol}: {e}")
+            return {}
+    
+    def _calculate_rsi(self, prices: List[float], period: int = 14) -> float:
+        """Calculate RSI indicator."""
+        if len(prices) < period + 1:
+            return 50.0
         
-        # Calculate price changes
-        changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+        gains = []
+        losses = []
         
-        if len(changes) < period:
-            return None
+        for i in range(1, len(prices)):
+            change = prices[i] - prices[i-1]
+            if change > 0:
+                gains.append(change)
+                losses.append(0)
+            else:
+                gains.append(0)
+                losses.append(abs(change))
         
-        # Separate gains and losses
-        gains = [change if change > 0 else 0 for change in changes[-period:]]
-        losses = [-change if change < 0 else 0 for change in changes[-period:]]
+        if len(gains) < period:
+            return 50.0
         
-        avg_gain = sum(gains) / period
-        avg_loss = sum(losses) / period
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
         
         if avg_loss == 0:
             return 100.0
@@ -459,71 +370,113 @@ class MarketDataRepository(BaseRepository[StockQuote]):
         
         return rsi
     
-    def _calculate_historical_volatility(self, prices: List[float], period: int) -> Optional[float]:
-        """Calculate historical volatility (annualized)."""
-        if len(prices) <= period:
-            return None
+    def _calculate_ema(self, prices: List[float], period: int) -> float:
+        """Calculate Exponential Moving Average."""
+        if len(prices) < period:
+            return sum(prices) / len(prices)
         
-        import math
+        multiplier = 2 / (period + 1)
+        ema = sum(prices[:period]) / period
         
-        # Calculate daily returns
-        returns = [math.log(prices[i] / prices[i-1]) for i in range(1, len(prices))]
-        recent_returns = returns[-period:]
+        for price in prices[period:]:
+            ema = (price * multiplier) + (ema * (1 - multiplier))
         
-        if not recent_returns:
-            return None
-        
-        # Calculate standard deviation
-        mean_return = sum(recent_returns) / len(recent_returns)
-        variance = sum((r - mean_return) ** 2 for r in recent_returns) / len(recent_returns)
-        daily_vol = math.sqrt(variance)
-        
-        # Annualize (252 trading days)
-        annual_vol = daily_vol * math.sqrt(252) * 100
-        
-        return annual_vol
+        return ema
     
-    @staticmethod
-    def _safe_decimal(value) -> Optional[Decimal]:
-        """Safely convert value to Decimal."""
-        if value is None or value == '' or value == 'N/A':
-            return None
-        try:
-            return Decimal(str(value))
-        except (ValueError, TypeError, ArithmeticError):
-            return None
-    
-    @staticmethod
-    def _safe_float(value) -> Optional[float]:
-        """Safely convert value to float."""
-        if value is None or value == '' or value == 'N/A':
-            return None
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return None
-    
-    @staticmethod
-    def _safe_int(value) -> Optional[int]:
-        """Safely convert value to int."""
-        if value is None or value == '' or value == 'N/A':
-            return None
-        try:
-            return int(float(value))
-        except (ValueError, TypeError):
-            return None
-    
-    def validate_entity(self, entity: StockQuote) -> bool:
-        """Validate stock quote entity."""
-        if not super().validate_entity(entity):
-            return False
+    def _calculate_macd(self, prices: List[float]) -> tuple:
+        """Calculate MACD indicator."""
+        if len(prices) < 26:
+            return 0.0, 0.0, 0.0
         
-        if not entity.symbol:
-            self.logger.error("Stock quote missing symbol")
-            return False
+        ema_12 = self._calculate_ema(prices, 12)
+        ema_26 = self._calculate_ema(prices, 26)
+        macd_line = ema_12 - ema_26
         
-        if entity.price <= 0:
-            self.logger.error("Stock quote has invalid price")
-            return False
+        # Calculate signal line (9-day EMA of MACD)
+        signal_line = macd_line  # Simplified for now
+        histogram = macd_line - signal_line
         
-        return True
+        return macd_line, signal_line, histogram
+    
+    def _calculate_bollinger_bands(self, prices: List[float], period: int = 20) -> tuple:
+        """Calculate Bollinger Bands."""
+        if len(prices) < period:
+            avg = sum(prices) / len(prices)
+            return avg, avg, avg
+        
+        sma = sum(prices[-period:]) / period
+        variance = sum((p - sma) ** 2 for p in prices[-period:]) / period
+        std_dev = variance ** 0.5
+        
+        upper_band = sma + (2 * std_dev)
+        lower_band = sma - (2 * std_dev)
+        
+        return upper_band, sma, lower_band
+    
+    def _calculate_atr(self, historical_data: List[Dict[str, Any]], period: int = 14) -> float:
+        """Calculate Average True Range."""
+        if len(historical_data) < period + 1:
+            return 0.0
+        
+        true_ranges = []
+        for i in range(1, len(historical_data)):
+            high = float(historical_data[i]['high'])
+            low = float(historical_data[i]['low'])
+            prev_close = float(historical_data[i-1]['close'])
+            
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close)
+            )
+            true_ranges.append(tr)
+        
+        if len(true_ranges) < period:
+            return sum(true_ranges) / len(true_ranges)
+        
+        return sum(true_ranges[-period:]) / period
+    
+    def _calculate_stochastic_k(self, historical_data: List[Dict[str, Any]], period: int = 14) -> float:
+        """Calculate Stochastic %K."""
+        if len(historical_data) < period:
+            return 50.0
+        
+        recent_data = historical_data[-period:]
+        current_close = float(historical_data[-1]['close'])
+        lowest_low = min(float(data['low']) for data in recent_data)
+        highest_high = max(float(data['high']) for data in recent_data)
+        
+        if highest_high == lowest_low:
+            return 50.0
+        
+        stoch_k = ((current_close - lowest_low) / (highest_high - lowest_low)) * 100
+        return stoch_k
+    
+    def _calculate_stochastic_d(self, historical_data: List[Dict[str, Any]], period: int = 14) -> float:
+        """Calculate Stochastic %D (3-day SMA of %K)."""
+        if len(historical_data) < period + 2:
+            return 50.0
+        
+        k_values = []
+        for i in range(3):
+            data_subset = historical_data[-(period + i):-(i if i > 0 else None)]
+            k_value = self._calculate_stochastic_k(data_subset, period)
+            k_values.append(k_value)
+        
+        return sum(k_values) / len(k_values)
+    
+    def _calculate_williams_r(self, historical_data: List[Dict[str, Any]], period: int = 14) -> float:
+        """Calculate Williams %R."""
+        if len(historical_data) < period:
+            return -50.0
+        
+        recent_data = historical_data[-period:]
+        current_close = float(historical_data[-1]['close'])
+        lowest_low = min(float(data['low']) for data in recent_data)
+        highest_high = max(float(data['high']) for data in recent_data)
+        
+        if highest_high == lowest_low:
+            return -50.0
+        
+        williams_r = ((highest_high - current_close) / (highest_high - lowest_low)) * -100
+        return williams_r

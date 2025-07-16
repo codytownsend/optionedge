@@ -1,653 +1,854 @@
 """
-Risk calculation service for comprehensive risk analysis and scenario testing.
+Risk metric calculations for portfolio and strategy analysis.
 """
 
-from abc import ABC, abstractmethod
 from datetime import datetime, date, timedelta
 from decimal import Decimal
-from typing import List, Dict, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
 from enum import Enum
-from dataclasses import dataclass
 import math
+import statistics
+import numpy as np
 import logging
 
-from ..entities.strategy import Strategy
-from ..entities.portfolio import Position, PortfolioConstraints
-from ...data.models.trades import TradeCandidate
-from ...data.models.options import Greeks
+from ...data.models.options import OptionQuote, OptionType, Greeks
+from ...data.models.market_data import OHLCVData, TechnicalIndicators
+from ...data.models.trades import (
+    StrategyDefinition, TradeCandidate, PortfolioGreeks, 
+    TradeFilterCriteria
+)
+from ...infrastructure.error_handling import (
+    handle_errors, CalculationError, RiskCalculationError
+)
 
-logger = logging.getLogger(__name__)
+from .probability_calculator import ProbabilityCalculator, ProbabilityParams, ProbabilityModel
 
 
-class RiskScenarioType(str, Enum):
-    """Types of risk scenarios."""
-    MARKET_CRASH = "market_crash"           # -20% to -50% market move
-    MARKET_RALLY = "market_rally"           # +20% to +50% market move  
-    VOLATILITY_SPIKE = "volatility_spike"   # 2x to 5x volatility increase
-    VOLATILITY_CRUSH = "volatility_crush"   # 50% to 80% volatility decrease
-    TIME_DECAY = "time_decay"               # Fast forward in time
-    INTEREST_RATE_CHANGE = "rate_change"    # Interest rate shifts
-    LIQUIDITY_CRISIS = "liquidity_crisis"   # Wide spreads, low volume
+class RiskMeasure(Enum):
+    """Types of risk measures."""
+    VALUE_AT_RISK = "value_at_risk"
+    CONDITIONAL_VAR = "conditional_var"
+    MAXIMUM_DRAWDOWN = "maximum_drawdown"
+    SHARPE_RATIO = "sharpe_ratio"
+    SORTINO_RATIO = "sortino_ratio"
+    CALMAR_RATIO = "calmar_ratio"
+    TAIL_RISK = "tail_risk"
+
+
+class ConfidenceLevel(Enum):
+    """Standard confidence levels for risk calculations."""
+    NINETY_PERCENT = 0.90
+    NINETY_FIVE_PERCENT = 0.95
+    NINETY_NINE_PERCENT = 0.99
 
 
 @dataclass
-class RiskScenario:
-    """Definition of a risk scenario for stress testing."""
-    
-    scenario_type: RiskScenarioType
+class StressScenario:
+    """Market stress scenario definition."""
     name: str
-    description: str
-    
-    # Market parameters
-    underlying_price_change: Optional[float] = None  # Percentage change
-    volatility_multiplier: Optional[float] = None     # Volatility scaling factor
-    time_forward_days: Optional[int] = None           # Days to fast-forward
-    interest_rate_change: Optional[float] = None      # Rate change in basis points
-    
-    # Liquidity parameters
-    spread_multiplier: Optional[float] = None         # Bid-ask spread scaling
-    volume_multiplier: Optional[float] = None         # Volume scaling
+    price_change: float  # Percentage change in underlying
+    volatility_change: float  # Change in implied volatility
+    time_decay_days: int = 0  # Days of time decay
+    interest_rate_change: float = 0.0  # Change in interest rates
+    description: str = ""
 
 
 @dataclass
 class RiskMetrics:
-    """Comprehensive risk metrics for a position or portfolio."""
+    """Comprehensive risk metrics for strategies and portfolios."""
+    # Basic risk measures
+    value_at_risk_95: float
+    conditional_var_95: float
+    maximum_drawdown: float
+    maximum_loss_scenario: float
     
-    # Basic metrics
-    current_value: Decimal
-    max_profit: Optional[Decimal]
-    max_loss: Optional[Decimal]
-    probability_of_profit: Optional[float]
+    # Risk-adjusted returns
+    sharpe_ratio: float
+    sortino_ratio: float
+    calmar_ratio: float
     
-    # Greeks
-    delta: Optional[float]
-    gamma: Optional[float]
-    theta: Optional[float]
-    vega: Optional[float]
-    rho: Optional[float]
-    
-    # Risk measures
-    value_at_risk_95: Optional[Decimal]
-    conditional_var_95: Optional[Decimal]
-    maximum_drawdown: Optional[Decimal]
-    sharpe_ratio: Optional[float]
+    # Distribution metrics
+    skewness: float
+    kurtosis: float
+    tail_ratio: float
     
     # Stress test results
-    stress_test_results: Dict[str, Decimal] = None
+    stress_test_results: Dict[str, float] = field(default_factory=dict)
     
     # Time-based metrics
-    break_even_time: Optional[int] = None  # Days to break even
-    profit_target_time: Optional[int] = None  # Days to reach profit target
+    holding_period_var: Optional[float] = None
+    time_to_min_profit: Optional[int] = None  # Days to minimum profit
     
-    def __post_init__(self):
-        if self.stress_test_results is None:
-            self.stress_test_results = {}
+    # Correlation risks
+    correlation_risk_score: float = 0.0
+    concentration_risk_score: float = 0.0
+
+
+@dataclass
+class PortfolioRiskProfile:
+    """Portfolio-level risk assessment."""
+    total_var_95: float
+    total_cvar_95: float
+    portfolio_beta: float
+    diversification_ratio: float
+    concentration_risk: float
+    
+    # Component risks
+    individual_strategy_vars: Dict[str, float] = field(default_factory=dict)
+    correlation_matrix: Dict[Tuple[str, str], float] = field(default_factory=dict)
+    
+    # Risk attribution
+    risk_contributions: Dict[str, float] = field(default_factory=dict)
+    marginal_vars: Dict[str, float] = field(default_factory=dict)
 
 
 class RiskCalculator:
     """
-    Service for calculating comprehensive risk metrics and performing scenario analysis.
+    Advanced risk calculation engine for options strategies and portfolios.
     
-    This service provides advanced risk calculations including Greeks analysis,
-    Value at Risk, stress testing, and portfolio-level risk aggregation.
+    Features:
+    - Value at Risk (VaR) calculations using multiple methodologies
+    - Conditional VaR (Expected Shortfall) for tail risk assessment
+    - Maximum loss scenarios under various market stress conditions
+    - Sharpe ratio and risk-adjusted return estimations
+    - Monte Carlo simulation for complex risk scenarios
+    - Greeks-based risk decomposition
+    - Portfolio-level risk aggregation with correlation effects
+    - Stress testing against historical market events
     """
     
     def __init__(self):
-        self.default_scenarios = self._create_default_scenarios()
+        self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
+        
+        # Initialize probability calculator for simulations
+        self.probability_calculator = ProbabilityCalculator()
+        
+        # Default stress scenarios
+        self.default_stress_scenarios = [
+            StressScenario("Black Monday 1987", -0.22, 2.0, 1, description="Historical crash scenario"),
+            StressScenario("Flash Crash 2010", -0.09, 1.5, 1, description="Intraday crash scenario"),
+            StressScenario("COVID Crash 2020", -0.34, 3.0, 14, description="Pandemic crash scenario"),
+            StressScenario("Dot-com Crash 2000", -0.15, 1.8, 30, description="Tech bubble burst"),
+            StressScenario("Financial Crisis 2008", -0.20, 2.5, 21, description="Credit crisis scenario"),
+            StressScenario("Moderate Correction", -0.10, 1.2, 7, description="Standard correction"),
+            StressScenario("Volatility Spike", 0.0, 2.0, 1, description="Pure volatility increase"),
+            StressScenario("Extended Decline", -0.05, 1.1, 60, description="Slow grind down")
+        ]
     
-    def calculate_strategy_risk(self, 
-                              strategy: Strategy,
-                              confidence_level: float = 0.95,
-                              time_horizon_days: int = 30) -> RiskMetrics:
+    @handle_errors(operation_name="calculate_strategy_risk")
+    def calculate_strategy_risk_metrics(
+        self,
+        strategy: StrategyDefinition,
+        current_price: Decimal,
+        historical_data: Optional[List[OHLCVData]] = None,
+        confidence_level: ConfidenceLevel = ConfidenceLevel.NINETY_FIVE_PERCENT,
+        stress_scenarios: Optional[List[StressScenario]] = None
+    ) -> RiskMetrics:
         """
-        Calculate comprehensive risk metrics for a strategy.
+        Calculate comprehensive risk metrics for a single strategy.
         
         Args:
-            strategy: Strategy to analyze
-            confidence_level: Confidence level for VaR calculation
-            time_horizon_days: Time horizon for risk calculations
+            strategy: Strategy definition
+            current_price: Current underlying price
+            historical_data: Historical price data
+            confidence_level: Confidence level for VaR calculations
+            stress_scenarios: Custom stress scenarios
             
         Returns:
             Comprehensive risk metrics
         """
-        logger.debug(f"Calculating risk metrics for {strategy.strategy_type}")
+        self.logger.info(f"Calculating risk metrics for {strategy.strategy_type.value}")
         
-        # Basic metrics
-        current_value = strategy.calculate_net_premium()
-        max_profit = strategy.calculate_max_profit()
-        max_loss = strategy.calculate_max_loss()
-        prob_profit = strategy.calculate_probability_of_profit()
+        if stress_scenarios is None:
+            stress_scenarios = self.default_stress_scenarios
         
-        # Greeks
-        net_greeks = strategy.calculate_net_greeks()
+        # Run Monte Carlo simulation for PnL distribution
+        pnl_distribution = self._simulate_strategy_pnl_distribution(
+            strategy, current_price, historical_data
+        )
         
-        # Value at Risk calculation
-        var_95 = self._calculate_value_at_risk(strategy, confidence_level, time_horizon_days)
-        cvar_95 = self._calculate_conditional_var(strategy, confidence_level, time_horizon_days)
+        # Calculate basic risk measures
+        var_95 = self._calculate_value_at_risk(pnl_distribution, confidence_level.value)
+        cvar_95 = self._calculate_conditional_var(pnl_distribution, confidence_level.value)
+        max_drawdown = self._calculate_maximum_drawdown(pnl_distribution)
         
-        # Stress testing
-        stress_results = self._perform_stress_tests(strategy, self.default_scenarios)
+        # Calculate risk-adjusted returns
+        sharpe_ratio = self._calculate_sharpe_ratio(pnl_distribution)
+        sortino_ratio = self._calculate_sortino_ratio(pnl_distribution)
+        calmar_ratio = self._calculate_calmar_ratio(pnl_distribution, max_drawdown)
         
-        # Time-based analysis
-        break_even_time = self._calculate_break_even_time(strategy)
+        # Calculate distribution metrics
+        skewness = self._calculate_skewness(pnl_distribution)
+        kurtosis = self._calculate_kurtosis(pnl_distribution)
+        tail_ratio = self._calculate_tail_ratio(pnl_distribution)
+        
+        # Run stress tests
+        stress_results = self._run_stress_tests(strategy, current_price, stress_scenarios)
+        max_loss_scenario = min(stress_results.values()) if stress_results else var_95
+        
+        # Calculate correlation and concentration risks
+        correlation_risk = self._calculate_strategy_correlation_risk(strategy)
+        concentration_risk = self._calculate_strategy_concentration_risk(strategy)
         
         return RiskMetrics(
-            current_value=current_value,
-            max_profit=max_profit,
-            max_loss=max_loss,
-            probability_of_profit=prob_profit,
-            delta=net_greeks.delta,
-            gamma=net_greeks.gamma,
-            theta=net_greeks.theta,
-            vega=net_greeks.vega,
-            rho=net_greeks.rho,
             value_at_risk_95=var_95,
             conditional_var_95=cvar_95,
+            maximum_drawdown=max_drawdown,
+            maximum_loss_scenario=max_loss_scenario,
+            sharpe_ratio=sharpe_ratio,
+            sortino_ratio=sortino_ratio,
+            calmar_ratio=calmar_ratio,
+            skewness=skewness,
+            kurtosis=kurtosis,
+            tail_ratio=tail_ratio,
             stress_test_results=stress_results,
-            break_even_time=break_even_time
+            correlation_risk_score=correlation_risk,
+            concentration_risk_score=concentration_risk
         )
     
-    def calculate_portfolio_risk(self, 
-                               position: Position,
-                               confidence_level: float = 0.95) -> RiskMetrics:
+    @handle_errors(operation_name="calculate_portfolio_risk")
+    def calculate_portfolio_risk_profile(
+        self,
+        strategies: List[TradeCandidate],
+        nav: Decimal,
+        historical_data: Optional[Dict[str, List[OHLCVData]]] = None,
+        confidence_level: ConfidenceLevel = ConfidenceLevel.NINETY_FIVE_PERCENT
+    ) -> PortfolioRiskProfile:
         """
-        Calculate portfolio-level risk metrics.
+        Calculate portfolio-level risk metrics with correlation effects.
         
         Args:
-            position: Current portfolio position
-            confidence_level: Confidence level for VaR calculation
+            strategies: List of portfolio strategies
+            nav: Portfolio net asset value
+            historical_data: Historical data by symbol
+            confidence_level: Confidence level for calculations
             
         Returns:
-            Portfolio risk metrics
+            Portfolio risk profile
         """
-        logger.debug(f"Calculating portfolio risk for {position.portfolio_id}")
+        self.logger.info(f"Calculating portfolio risk for {len(strategies)} strategies")
         
-        # Aggregate portfolio values
-        current_value = position.nav
-        total_unrealized = position.get_total_unrealized_pnl()
+        if not strategies:
+            raise CalculationError("No strategies provided for portfolio risk calculation")
         
-        # Aggregate Greeks
-        net_delta = position.get_net_delta()
-        net_vega = position.get_net_vega()
-        net_theta = position.get_net_theta()
+        # Calculate individual strategy VaRs
+        individual_vars = {}
+        strategy_pnl_distributions = {}
         
-        # Portfolio-level VaR (simplified aggregation)
-        portfolio_var = self._calculate_portfolio_var(position, confidence_level)
+        for i, trade_candidate in enumerate(strategies):
+            strategy = trade_candidate.strategy
+            symbol = strategy.underlying
+            
+            # Get historical data for this symbol
+            symbol_data = historical_data.get(symbol) if historical_data else None
+            
+            # Use last known price or default
+            current_price = Decimal('100')  # Would get from market data in practice
+            
+            # Calculate strategy PnL distribution
+            pnl_dist = self._simulate_strategy_pnl_distribution(
+                strategy, current_price, symbol_data
+            )
+            strategy_pnl_distributions[f"strategy_{i}"] = pnl_dist
+            
+            # Calculate individual VaR
+            var_95 = self._calculate_value_at_risk(pnl_dist, confidence_level.value)
+            individual_vars[f"strategy_{i}"] = var_95
         
-        # Stress test portfolio
-        portfolio_stress_results = self._perform_portfolio_stress_tests(position)
+        # Calculate portfolio correlation matrix
+        correlation_matrix = self._calculate_portfolio_correlations(strategy_pnl_distributions)
         
-        return RiskMetrics(
-            current_value=current_value,
-            max_profit=None,  # Not applicable at portfolio level
-            max_loss=None,    # Not applicable at portfolio level
-            probability_of_profit=None,
-            delta=net_delta,
-            gamma=0.0,  # Would need to aggregate from individual strategies
-            theta=net_theta,
-            vega=net_vega,
-            rho=0.0,
-            value_at_risk_95=portfolio_var,
-            stress_test_results=portfolio_stress_results
+        # Calculate portfolio VaR with correlations
+        portfolio_var = self._calculate_portfolio_var(individual_vars, correlation_matrix)
+        portfolio_cvar = self._calculate_portfolio_cvar(strategy_pnl_distributions, confidence_level.value)
+        
+        # Calculate diversification ratio
+        diversification_ratio = self._calculate_diversification_ratio(individual_vars, portfolio_var)
+        
+        # Calculate portfolio beta (simplified)
+        portfolio_beta = self._calculate_portfolio_beta(strategies)
+        
+        # Calculate concentration risk
+        concentration_risk = self._calculate_portfolio_concentration_risk(strategies, nav)
+        
+        # Calculate risk contributions
+        risk_contributions = self._calculate_risk_contributions(individual_vars, correlation_matrix)
+        
+        # Calculate marginal VaRs
+        marginal_vars = self._calculate_marginal_vars(individual_vars, correlation_matrix)
+        
+        return PortfolioRiskProfile(
+            total_var_95=portfolio_var,
+            total_cvar_95=portfolio_cvar,
+            portfolio_beta=portfolio_beta,
+            diversification_ratio=diversification_ratio,
+            concentration_risk=concentration_risk,
+            individual_strategy_vars=individual_vars,
+            correlation_matrix=correlation_matrix,
+            risk_contributions=risk_contributions,
+            marginal_vars=marginal_vars
         )
     
-    def scenario_analysis(self, 
-                         strategy: Strategy,
-                         scenarios: List[RiskScenario]) -> Dict[str, Decimal]:
-        """
-        Perform scenario analysis on a strategy.
+    def _simulate_strategy_pnl_distribution(
+        self,
+        strategy: StrategyDefinition,
+        current_price: Decimal,
+        historical_data: Optional[List[OHLCVData]] = None,
+        num_simulations: int = 10000
+    ) -> List[float]:
+        """Simulate PnL distribution for strategy using Monte Carlo."""
         
-        Args:
-            strategy: Strategy to analyze
-            scenarios: List of scenarios to test
-            
-        Returns:
-            Dictionary mapping scenario names to P&L impacts
-        """
-        results = {}
+        if not strategy.expiration:
+            raise CalculationError("Strategy missing expiration date")
         
-        for scenario in scenarios:
-            try:
-                pnl_impact = self._calculate_scenario_impact(strategy, scenario)
-                results[scenario.name] = pnl_impact
-            except Exception as e:
-                logger.warning(f"Failed to calculate scenario {scenario.name}: {e}")
-                results[scenario.name] = Decimal('0')
+        time_to_expiration = (strategy.expiration - date.today()).days / 365.25
+        if time_to_expiration <= 0:
+            raise CalculationError("Strategy already expired")
         
-        return results
-    
-    def calculate_option_sensitivities(self, 
-                                     strategy: Strategy,
-                                     price_range_pct: float = 0.20,
-                                     vol_range_pct: float = 0.50,
-                                     time_steps: int = 10) -> Dict[str, List[Tuple[float, Decimal]]]:
-        """
-        Calculate option sensitivities across ranges of parameters.
+        # Estimate volatility
+        volatility = self._estimate_volatility(historical_data) if historical_data else 0.25
         
-        Args:
-            strategy: Strategy to analyze
-            price_range_pct: Price range as percentage of current price
-            vol_range_pct: Volatility range as percentage of current vol
-            time_steps: Number of steps in each dimension
-            
-        Returns:
-            Dictionary of sensitivity analyses
-        """
-        if not strategy.underlying_price:
-            return {}
-        
-        sensitivities = {}
-        base_price = float(strategy.underlying_price)
-        
-        # Price sensitivity
-        price_points = []
-        price_min = base_price * (1 - price_range_pct)
-        price_max = base_price * (1 + price_range_pct)
-        
-        for i in range(time_steps + 1):
-            price = price_min + (price_max - price_min) * i / time_steps
-            pnl = strategy._calculate_pnl_at_price(Decimal(str(price)))
-            price_points.append((price, pnl))
-        
-        sensitivities['price_sensitivity'] = price_points
-        
-        # Time decay sensitivity
-        time_points = []
-        days_to_exp = strategy.get_days_to_expiration()
-        
-        for i in range(min(days_to_exp, time_steps) + 1):
-            # Simplified time decay calculation
-            time_factor = 1 - (i / days_to_exp) if days_to_exp > 0 else 1
-            # This is a simplified approach - real implementation would use Greeks
-            estimated_pnl = strategy.calculate_net_premium() * Decimal(str(time_factor))
-            time_points.append((i, estimated_pnl))
-        
-        sensitivities['time_decay'] = time_points
-        
-        return sensitivities
-    
-    def _calculate_value_at_risk(self, 
-                               strategy: Strategy,
-                               confidence_level: float,
-                               time_horizon_days: int) -> Optional[Decimal]:
-        """Calculate Value at Risk using Monte Carlo simulation."""
-        if not strategy.underlying_price:
-            return None
-        
-        # Get average implied volatility
-        ivs = []
-        for leg in strategy.legs:
-            if leg.option.implied_volatility:
-                ivs.append(leg.option.implied_volatility)
-        
-        if not ivs:
-            return None
-        
-        avg_vol = sum(ivs) / len(ivs)
-        
-        # Monte Carlo simulation
-        num_simulations = 1000
         pnl_outcomes = []
-        
-        current_price = float(strategy.underlying_price)
-        time_to_horizon = time_horizon_days / 365.0
+        current_price_float = float(current_price)
         
         for _ in range(num_simulations):
-            # Simulate price at time horizon
-            final_price = self._simulate_price_gbm(current_price, avg_vol, time_to_horizon)
+            # Simulate final price using geometric Brownian motion
+            drift = 0.05 - 0.5 * volatility ** 2  # Risk-free rate minus dividend yield
+            random_shock = np.random.normal(0, 1) * volatility * math.sqrt(time_to_expiration)
+            final_price = current_price_float * math.exp(drift * time_to_expiration + random_shock)
             
-            # Calculate P&L at final price
-            pnl = strategy._calculate_pnl_at_price(Decimal(str(final_price)))
+            # Calculate strategy PnL at this final price
+            pnl = self._calculate_strategy_pnl_at_expiration(strategy, Decimal(str(final_price)), current_price)
             pnl_outcomes.append(float(pnl))
         
-        # Calculate VaR
-        pnl_outcomes.sort()
-        var_index = int((1 - confidence_level) * num_simulations)
-        var_value = pnl_outcomes[var_index]
-        
-        return Decimal(str(var_value))
+        return pnl_outcomes
     
-    def _calculate_conditional_var(self,
-                                 strategy: Strategy,
-                                 confidence_level: float,
-                                 time_horizon_days: int) -> Optional[Decimal]:
-        """Calculate Conditional Value at Risk (Expected Shortfall)."""
-        var = self._calculate_value_at_risk(strategy, confidence_level, time_horizon_days)
+    def _calculate_strategy_pnl_at_expiration(
+        self,
+        strategy: StrategyDefinition,
+        final_price: Decimal,
+        initial_price: Decimal
+    ) -> Decimal:
+        """Calculate strategy P&L at expiration for given final price."""
         
-        if not var:
-            return None
+        total_pnl = Decimal('0')
         
-        # Simplified CVaR calculation - would need full simulation data
-        # CVaR is typically 20-50% worse than VaR
-        cvar_multiplier = 1.3
-        return var * Decimal(str(cvar_multiplier))
+        for leg in strategy.legs:
+            # Calculate intrinsic value at expiration
+            intrinsic_value = leg.option.calculate_intrinsic_value(final_price)
+            
+            # Calculate P&L for this leg
+            if leg.direction.value == "BUY":
+                # Paid premium, receive intrinsic value
+                leg_pnl = intrinsic_value - (leg.option.mid_price or Decimal('0'))
+            else:  # SELL
+                # Received premium, pay intrinsic value
+                leg_pnl = (leg.option.mid_price or Decimal('0')) - intrinsic_value
+            
+            # Multiply by quantity and contract size
+            leg_pnl *= leg.quantity * 100  # 100 shares per contract
+            
+            total_pnl += leg_pnl
+        
+        return total_pnl
     
-    def _perform_stress_tests(self, 
-                            strategy: Strategy,
-                            scenarios: List[RiskScenario]) -> Dict[str, Decimal]:
-        """Perform stress tests on strategy."""
-        results = {}
+    def _calculate_value_at_risk(self, pnl_distribution: List[float], confidence_level: float) -> float:
+        """Calculate Value at Risk at specified confidence level."""
         
-        for scenario in scenarios:
+        if not pnl_distribution:
+            return 0.0
+        
+        sorted_pnls = sorted(pnl_distribution)
+        var_index = int((1 - confidence_level) * len(sorted_pnls))
+        return sorted_pnls[var_index]
+    
+    def _calculate_conditional_var(self, pnl_distribution: List[float], confidence_level: float) -> float:
+        """Calculate Conditional VaR (Expected Shortfall)."""
+        
+        if not pnl_distribution:
+            return 0.0
+        
+        sorted_pnls = sorted(pnl_distribution)
+        var_index = int((1 - confidence_level) * len(sorted_pnls))
+        
+        # Average of all losses worse than VaR
+        tail_losses = sorted_pnls[:var_index]
+        return statistics.mean(tail_losses) if tail_losses else 0.0
+    
+    def _calculate_maximum_drawdown(self, pnl_distribution: List[float]) -> float:
+        """Calculate maximum drawdown from PnL distribution."""
+        
+        if not pnl_distribution:
+            return 0.0
+        
+        # Simulate cumulative returns
+        cumulative_pnl = 0
+        max_pnl = 0
+        max_drawdown = 0
+        
+        for pnl in pnl_distribution:
+            cumulative_pnl += pnl
+            max_pnl = max(max_pnl, cumulative_pnl)
+            drawdown = max_pnl - cumulative_pnl
+            max_drawdown = max(max_drawdown, drawdown)
+        
+        return max_drawdown
+    
+    def _calculate_sharpe_ratio(self, pnl_distribution: List[float], risk_free_rate: float = 0.05) -> float:
+        """Calculate Sharpe ratio from PnL distribution."""
+        
+        if not pnl_distribution or len(pnl_distribution) < 2:
+            return 0.0
+        
+        try:
+            mean_return = statistics.mean(pnl_distribution)
+            std_return = statistics.stdev(pnl_distribution)
+            
+            if std_return == 0:
+                return 0.0
+            
+            # Annualize assuming daily returns
+            annual_return = mean_return * 252
+            annual_std = std_return * math.sqrt(252)
+            
+            return (annual_return - risk_free_rate) / annual_std
+            
+        except Exception:
+            return 0.0
+    
+    def _calculate_sortino_ratio(self, pnl_distribution: List[float], risk_free_rate: float = 0.05) -> float:
+        """Calculate Sortino ratio (downside deviation only)."""
+        
+        if not pnl_distribution:
+            return 0.0
+        
+        try:
+            mean_return = statistics.mean(pnl_distribution)
+            negative_returns = [r for r in pnl_distribution if r < 0]
+            
+            if not negative_returns:
+                return float('inf') if mean_return > 0 else 0.0
+            
+            downside_std = statistics.stdev(negative_returns) if len(negative_returns) > 1 else 0.0
+            
+            if downside_std == 0:
+                return 0.0
+            
+            # Annualize
+            annual_return = mean_return * 252
+            annual_downside_std = downside_std * math.sqrt(252)
+            
+            return (annual_return - risk_free_rate) / annual_downside_std
+            
+        except Exception:
+            return 0.0
+    
+    def _calculate_calmar_ratio(self, pnl_distribution: List[float], max_drawdown: float) -> float:
+        """Calculate Calmar ratio (return/max drawdown)."""
+        
+        if not pnl_distribution or max_drawdown == 0:
+            return 0.0
+        
+        try:
+            annual_return = statistics.mean(pnl_distribution) * 252
+            return annual_return / max_drawdown
+        except Exception:
+            return 0.0
+    
+    def _calculate_skewness(self, pnl_distribution: List[float]) -> float:
+        """Calculate skewness of PnL distribution."""
+        
+        if len(pnl_distribution) < 3:
+            return 0.0
+        
+        try:
+            mean_pnl = statistics.mean(pnl_distribution)
+            std_pnl = statistics.stdev(pnl_distribution)
+            
+            if std_pnl == 0:
+                return 0.0
+            
+            skewness = sum((x - mean_pnl) ** 3 for x in pnl_distribution) / len(pnl_distribution)
+            return skewness / (std_pnl ** 3)
+            
+        except Exception:
+            return 0.0
+    
+    def _calculate_kurtosis(self, pnl_distribution: List[float]) -> float:
+        """Calculate kurtosis of PnL distribution."""
+        
+        if len(pnl_distribution) < 4:
+            return 0.0
+        
+        try:
+            mean_pnl = statistics.mean(pnl_distribution)
+            std_pnl = statistics.stdev(pnl_distribution)
+            
+            if std_pnl == 0:
+                return 0.0
+            
+            kurtosis = sum((x - mean_pnl) ** 4 for x in pnl_distribution) / len(pnl_distribution)
+            return kurtosis / (std_pnl ** 4) - 3  # Excess kurtosis
+            
+        except Exception:
+            return 0.0
+    
+    def _calculate_tail_ratio(self, pnl_distribution: List[float]) -> float:
+        """Calculate tail ratio (95th percentile / 5th percentile)."""
+        
+        if len(pnl_distribution) < 20:
+            return 1.0
+        
+        try:
+            sorted_pnls = sorted(pnl_distribution)
+            p95 = sorted_pnls[int(0.95 * len(sorted_pnls))]
+            p5 = sorted_pnls[int(0.05 * len(sorted_pnls))]
+            
+            if p5 == 0:
+                return float('inf') if p95 > 0 else 1.0
+            
+            return abs(p95 / p5)
+            
+        except Exception:
+            return 1.0
+    
+    def _run_stress_tests(
+        self,
+        strategy: StrategyDefinition,
+        current_price: Decimal,
+        stress_scenarios: List[StressScenario]
+    ) -> Dict[str, float]:
+        """Run stress tests against predefined scenarios."""
+        
+        stress_results = {}
+        
+        for scenario in stress_scenarios:
             try:
-                impact = self._calculate_scenario_impact(strategy, scenario)
-                results[scenario.name] = impact
+                # Calculate stressed price
+                stressed_price = current_price * (1 + Decimal(str(scenario.price_change)))
+                
+                # Calculate PnL under stress
+                stress_pnl = self._calculate_strategy_pnl_at_expiration(
+                    strategy, stressed_price, current_price
+                )
+                
+                # Apply time decay if specified
+                if scenario.time_decay_days > 0:
+                    theta_decay = self._estimate_theta_decay(strategy, scenario.time_decay_days)
+                    stress_pnl += Decimal(str(theta_decay))
+                
+                stress_results[scenario.name] = float(stress_pnl)
+                
             except Exception as e:
-                logger.warning(f"Stress test failed for {scenario.name}: {e}")
-                results[scenario.name] = Decimal('0')
+                self.logger.warning(f"Failed to calculate stress scenario {scenario.name}: {str(e)}")
+                stress_results[scenario.name] = 0.0
         
-        return results
+        return stress_results
     
-    def _calculate_scenario_impact(self, 
-                                 strategy: Strategy,
-                                 scenario: RiskScenario) -> Decimal:
-        """Calculate P&L impact of a specific scenario."""
-        if not strategy.underlying_price:
-            return Decimal('0')
+    def _calculate_strategy_correlation_risk(self, strategy: StrategyDefinition) -> float:
+        """Calculate correlation risk score for strategy."""
         
-        current_price = strategy.underlying_price
-        
-        # Apply scenario to underlying price
-        if scenario.underlying_price_change:
-            scenario_price = current_price * (1 + scenario.underlying_price_change)
+        # Simplified correlation risk based on strategy type
+        if strategy.strategy_type.value in ["PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"]:
+            return 0.3  # Moderate correlation with underlying
+        elif strategy.strategy_type.value == "IRON_CONDOR":
+            return 0.1  # Low correlation risk (market neutral)
         else:
-            scenario_price = current_price
-        
-        # Calculate P&L at scenario price
-        scenario_pnl = strategy._calculate_pnl_at_price(scenario_price)
-        base_pnl = strategy.calculate_net_premium()
-        
-        # Return the impact (difference from base case)
-        return scenario_pnl - base_pnl
+            return 0.5  # Default moderate risk
     
-    def _calculate_portfolio_var(self, 
-                               position: Position,
-                               confidence_level: float) -> Optional[Decimal]:
-        """Calculate portfolio-level Value at Risk."""
-        # Simplified portfolio VaR - would need correlation matrix in real implementation
-        total_var_squared = Decimal('0')
+    def _calculate_strategy_concentration_risk(self, strategy: StrategyDefinition) -> float:
+        """Calculate concentration risk score for strategy."""
         
-        for trade in position.active_trades:
-            strategy = trade.trade_candidate.strategy
-            individual_var = self._calculate_value_at_risk(strategy, confidence_level, 30)
+        # Risk based on number of legs and strike concentration
+        num_legs = len(strategy.legs)
+        
+        if num_legs == 1:
+            return 1.0  # High concentration
+        elif num_legs == 2:
+            return 0.6  # Moderate concentration
+        elif num_legs >= 4:
+            return 0.2  # Low concentration (iron condor/butterfly)
+        else:
+            return 0.4  # Default
+    
+    def _calculate_portfolio_correlations(
+        self,
+        strategy_distributions: Dict[str, List[float]]
+    ) -> Dict[Tuple[str, str], float]:
+        """Calculate correlation matrix between strategies."""
+        
+        correlation_matrix = {}
+        strategy_names = list(strategy_distributions.keys())
+        
+        for i, strategy1 in enumerate(strategy_names):
+            for j, strategy2 in enumerate(strategy_names):
+                if i <= j:  # Only calculate upper triangle + diagonal
+                    if strategy1 == strategy2:
+                        correlation = 1.0
+                    else:
+                        correlation = self._calculate_correlation(
+                            strategy_distributions[strategy1],
+                            strategy_distributions[strategy2]
+                        )
+                    correlation_matrix[(strategy1, strategy2)] = correlation
+                    if i != j:  # Also set symmetric entry
+                        correlation_matrix[(strategy2, strategy1)] = correlation
+        
+        return correlation_matrix
+    
+    def _calculate_correlation(self, series1: List[float], series2: List[float]) -> float:
+        """Calculate correlation coefficient between two series."""
+        
+        if len(series1) != len(series2) or len(series1) < 2:
+            return 0.0
+        
+        try:
+            mean1 = statistics.mean(series1)
+            mean2 = statistics.mean(series2)
             
-            if individual_var:
-                total_var_squared += individual_var ** 2
-        
-        if total_var_squared > 0:
-            # Simple sum (assumes no correlation)
-            return total_var_squared.sqrt()
-        
-        return None
-    
-    def _perform_portfolio_stress_tests(self, position: Position) -> Dict[str, Decimal]:
-        """Perform stress tests on entire portfolio."""
-        results = {}
-        
-        for scenario in self.default_scenarios:
-            total_impact = Decimal('0')
+            numerator = sum((x1 - mean1) * (x2 - mean2) for x1, x2 in zip(series1, series2))
             
-            for trade in position.active_trades:
-                strategy = trade.trade_candidate.strategy
-                impact = self._calculate_scenario_impact(strategy, scenario)
-                total_impact += impact
+            sum_sq1 = sum((x1 - mean1) ** 2 for x1 in series1)
+            sum_sq2 = sum((x2 - mean2) ** 2 for x2 in series2)
             
-            results[scenario.name] = total_impact
-        
-        return results
-    
-    def _calculate_break_even_time(self, strategy: Strategy) -> Optional[int]:
-        """Calculate days to break even (simplified)."""
-        net_greeks = strategy.calculate_net_greeks()
-        
-        if not net_greeks.theta or net_greeks.theta >= 0:
-            return None
-        
-        current_pnl = strategy.calculate_net_premium()
-        daily_theta = net_greeks.theta  # Simplified - theta is already daily
-        
-        if current_pnl >= 0:
-            return 0  # Already profitable
-        
-        # Days to break even = -current_loss / daily_theta_gain
-        days_to_break_even = -float(current_pnl) / daily_theta
-        
-        return max(0, int(days_to_break_even))
-    
-    def _simulate_price_gbm(self, 
-                          current_price: float,
-                          volatility: float,
-                          time_years: float) -> float:
-        """Simulate price using Geometric Brownian Motion."""
-        import random
-        
-        # Risk-free rate (simplified)
-        r = 0.05
-        
-        # Generate random normal variable
-        z = random.gauss(0, 1)
-        
-        # GBM formula
-        drift = (r - 0.5 * volatility**2) * time_years
-        diffusion = volatility * math.sqrt(time_years) * z
-        
-        final_price = current_price * math.exp(drift + diffusion)
-        return final_price
-    
-    def _create_default_scenarios(self) -> List[RiskScenario]:
-        """Create default stress testing scenarios."""
-        return [
-            RiskScenario(
-                scenario_type=RiskScenarioType.MARKET_CRASH,
-                name="Market Crash -20%",
-                description="20% market decline",
-                underlying_price_change=-0.20
-            ),
-            RiskScenario(
-                scenario_type=RiskScenarioType.MARKET_CRASH,
-                name="Severe Market Crash -35%",
-                description="35% market decline",
-                underlying_price_change=-0.35
-            ),
-            RiskScenario(
-                scenario_type=RiskScenarioType.MARKET_RALLY,
-                name="Market Rally +20%",
-                description="20% market rally",
-                underlying_price_change=0.20
-            ),
-            RiskScenario(
-                scenario_type=RiskScenarioType.VOLATILITY_SPIKE,
-                name="Volatility Spike 3x",
-                description="Volatility increases 3x",
-                volatility_multiplier=3.0
-            ),
-            RiskScenario(
-                scenario_type=RiskScenarioType.VOLATILITY_CRUSH,
-                name="Volatility Crush 50%",
-                description="Volatility drops 50%",
-                volatility_multiplier=0.5
-            ),
-            RiskScenario(
-                scenario_type=RiskScenarioType.TIME_DECAY,
-                name="Time Decay 1 Week",
-                description="Fast forward 1 week",
-                time_forward_days=7
-            ),
-            RiskScenario(
-                scenario_type=RiskScenarioType.TIME_DECAY,
-                name="Time Decay 2 Weeks",
-                description="Fast forward 2 weeks",
-                time_forward_days=14
-            )
-        ]
-
-
-class PortfolioRiskAnalyzer:
-    """
-    Specialized risk analyzer for portfolio-level risk management.
-    
-    This class focuses on portfolio-level risk aggregation, correlation
-    analysis, and portfolio optimization from a risk perspective.
-    """
-    
-    def __init__(self, risk_calculator: RiskCalculator):
-        self.risk_calculator = risk_calculator
-    
-    def analyze_portfolio_risk(self, position: Position) -> Dict[str, Any]:
-        """
-        Comprehensive portfolio risk analysis.
-        
-        Args:
-            position: Current portfolio position
+            denominator = math.sqrt(sum_sq1 * sum_sq2)
             
-        Returns:
-            Detailed risk analysis results
-        """
-        # Basic risk metrics
-        risk_metrics = self.risk_calculator.calculate_portfolio_risk(position)
-        
-        # Concentration analysis
-        concentration_analysis = self._analyze_concentration(position)
-        
-        # Liquidity analysis
-        liquidity_analysis = self._analyze_liquidity(position)
-        
-        # Greeks analysis
-        greeks_analysis = self._analyze_greeks_exposure(position)
-        
-        return {
-            'risk_metrics': risk_metrics,
-            'concentration_analysis': concentration_analysis,
-            'liquidity_analysis': liquidity_analysis,
-            'greeks_analysis': greeks_analysis,
-            'overall_risk_score': self._calculate_risk_score(position)
-        }
-    
-    def _analyze_concentration(self, position: Position) -> Dict[str, Any]:
-        """Analyze portfolio concentration risks."""
-        sector_exposure = position.get_trades_by_sector()
-        strategy_exposure = position.get_trades_by_strategy_type()
-        
-        # Calculate concentration metrics
-        total_trades = len(position.active_trades)
-        max_sector_concentration = max(sector_exposure.values()) if sector_exposure else 0
-        max_strategy_concentration = max(strategy_exposure.values()) if strategy_exposure else 0
-        
-        return {
-            'sector_exposure': dict(sector_exposure),
-            'strategy_exposure': {k.value: v for k, v in strategy_exposure.items()},
-            'max_sector_concentration_pct': max_sector_concentration / total_trades if total_trades > 0 else 0,
-            'max_strategy_concentration_pct': max_strategy_concentration / total_trades if total_trades > 0 else 0,
-            'diversification_score': self._calculate_diversification_score(sector_exposure, strategy_exposure)
-        }
-    
-    def _analyze_liquidity(self, position: Position) -> Dict[str, Any]:
-        """Analyze portfolio liquidity profile."""
-        total_trades = len(position.active_trades)
-        liquid_trades = 0
-        total_volume = 0
-        total_open_interest = 0
-        
-        for trade in position.active_trades:
-            strategy = trade.trade_candidate.strategy
+            if denominator == 0:
+                return 0.0
             
-            # Check if all legs are liquid
-            all_legs_liquid = True
-            for leg in strategy.legs:
-                volume = leg.option.volume or 0
-                open_interest = leg.option.open_interest or 0
+            return numerator / denominator
+            
+        except Exception:
+            return 0.0
+    
+    def _calculate_portfolio_var(
+        self,
+        individual_vars: Dict[str, float],
+        correlation_matrix: Dict[Tuple[str, str], float]
+    ) -> float:
+        """Calculate portfolio VaR with correlation effects."""
+        
+        strategy_names = list(individual_vars.keys())
+        
+        if len(strategy_names) == 1:
+            return list(individual_vars.values())[0]
+        
+        # Portfolio variance calculation with correlations
+        portfolio_variance = 0.0
+        
+        for i, strategy1 in enumerate(strategy_names):
+            for j, strategy2 in enumerate(strategy_names):
+                var1 = individual_vars[strategy1]
+                var2 = individual_vars[strategy2]
                 
-                total_volume += volume
-                total_open_interest += open_interest
+                correlation = correlation_matrix.get((strategy1, strategy2), 0.0)
                 
-                if volume < 10 or open_interest < 100:
-                    all_legs_liquid = False
+                # Assume equal weights for simplicity
+                weight1 = weight2 = 1.0 / len(strategy_names)
+                
+                portfolio_variance += weight1 * weight2 * var1 * var2 * correlation
+        
+        return math.sqrt(max(0, portfolio_variance))
+    
+    def _calculate_portfolio_cvar(
+        self,
+        strategy_distributions: Dict[str, List[float]],
+        confidence_level: float
+    ) -> float:
+        """Calculate portfolio Conditional VaR."""
+        
+        # Combine all strategy PnLs (assuming equal weights)
+        if not strategy_distributions:
+            return 0.0
+        
+        # Get minimum length to ensure all series have same length
+        min_length = min(len(dist) for dist in strategy_distributions.values())
+        
+        # Calculate portfolio PnL for each simulation
+        portfolio_pnls = []
+        weight = 1.0 / len(strategy_distributions)
+        
+        for i in range(min_length):
+            portfolio_pnl = sum(weight * dist[i] for dist in strategy_distributions.values())
+            portfolio_pnls.append(portfolio_pnl)
+        
+        return self._calculate_conditional_var(portfolio_pnls, confidence_level)
+    
+    def _calculate_diversification_ratio(
+        self,
+        individual_vars: Dict[str, float],
+        portfolio_var: float
+    ) -> float:
+        """Calculate diversification ratio."""
+        
+        if not individual_vars or portfolio_var == 0:
+            return 1.0
+        
+        # Weighted average of individual VaRs
+        weight = 1.0 / len(individual_vars)
+        weighted_avg_var = sum(weight * var for var in individual_vars.values())
+        
+        if weighted_avg_var == 0:
+            return 1.0
+        
+        return weighted_avg_var / portfolio_var
+    
+    def _calculate_portfolio_beta(self, strategies: List[TradeCandidate]) -> float:
+        """Calculate portfolio beta (simplified)."""
+        
+        if not strategies:
+            return 1.0
+        
+        # Simplified beta calculation based on strategy types
+        total_beta = 0.0
+        weight = 1.0 / len(strategies)
+        
+        for trade_candidate in strategies:
+            strategy = trade_candidate.strategy
             
-            if all_legs_liquid:
-                liquid_trades += 1
+            # Assign beta based on strategy type
+            if strategy.strategy_type.value in ["PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"]:
+                strategy_beta = 0.3  # Moderate market exposure
+            elif strategy.strategy_type.value == "IRON_CONDOR":
+                strategy_beta = 0.1  # Low market exposure
+            elif strategy.strategy_type.value == "COVERED_CALL":
+                strategy_beta = 0.8  # High market exposure
+            else:
+                strategy_beta = 0.5  # Default
+            
+            total_beta += weight * strategy_beta
         
-        return {
-            'total_trades': total_trades,
-            'liquid_trades': liquid_trades,
-            'liquidity_ratio': liquid_trades / total_trades if total_trades > 0 else 1.0,
-            'avg_volume_per_trade': total_volume / total_trades if total_trades > 0 else 0,
-            'avg_open_interest_per_trade': total_open_interest / total_trades if total_trades > 0 else 0
-        }
+        return total_beta
     
-    def _analyze_greeks_exposure(self, position: Position) -> Dict[str, Any]:
-        """Analyze portfolio Greeks exposure."""
-        constraints = position.constraints
+    def _calculate_portfolio_concentration_risk(
+        self,
+        strategies: List[TradeCandidate],
+        nav: Decimal
+    ) -> float:
+        """Calculate portfolio concentration risk."""
         
-        net_delta = position.get_net_delta()
-        net_vega = position.get_net_vega()
-        net_theta = position.get_net_theta()
+        if not strategies:
+            return 0.0
         
-        max_delta = constraints.max_delta_exposure
-        min_vega = constraints.min_vega_exposure
+        # Calculate position sizes as percentage of NAV
+        position_weights = []
         
-        return {
-            'net_delta': net_delta,
-            'net_vega': net_vega,
-            'net_theta': net_theta,
-            'delta_utilization': abs(net_delta) / max_delta if max_delta > 0 else 0,
-            'vega_headroom': net_vega - min_vega,
-            'theta_income_daily': net_theta,  # Daily theta income
-            'greeks_within_limits': (abs(net_delta) <= max_delta and net_vega >= min_vega)
-        }
-    
-    def _calculate_diversification_score(self, 
-                                       sector_exposure: Dict[str, int],
-                                       strategy_exposure: Dict[Any, int]) -> float:
-        """Calculate diversification score (0-100)."""
-        total_trades = sum(sector_exposure.values())
+        for trade_candidate in strategies:
+            strategy = trade_candidate.strategy
+            
+            # Estimate position size based on max loss
+            if strategy.max_loss:
+                position_size = float(strategy.max_loss) / float(nav)
+            else:
+                position_size = 0.01  # Default 1%
+            
+            position_weights.append(position_size)
         
-        if total_trades <= 1:
-            return 100.0  # Single trade is fully "diversified" in its own category
+        if not position_weights:
+            return 0.0
         
         # Calculate Herfindahl-Hirschman Index for concentration
-        sector_hhi = sum((count / total_trades) ** 2 for count in sector_exposure.values())
-        strategy_hhi = sum((count / total_trades) ** 2 for count in strategy_exposure.values())
+        hhi = sum(weight ** 2 for weight in position_weights)
         
-        # Average HHI (lower is more diversified)
-        avg_hhi = (sector_hhi + strategy_hhi) / 2
-        
-        # Convert to diversification score (higher is better)
-        # HHI ranges from 1/n to 1, where n is number of categories
-        diversification_score = (1 - avg_hhi) * 100
-        
-        return max(0, min(100, diversification_score))
+        # Normalize to 0-1 scale (1 = maximum concentration)
+        max_hhi = 1.0  # If all capital in one position
+        return hhi / max_hhi
     
-    def _calculate_risk_score(self, position: Position) -> float:
-        """Calculate overall portfolio risk score (0-100, lower is riskier)."""
-        score = 100.0
+    def _calculate_risk_contributions(
+        self,
+        individual_vars: Dict[str, float],
+        correlation_matrix: Dict[Tuple[str, str], float]
+    ) -> Dict[str, float]:
+        """Calculate risk contribution of each strategy to portfolio risk."""
         
-        # Utilization penalties
-        utilization = position.calculate_utilization_metrics()
+        risk_contributions = {}
+        total_var = sum(individual_vars.values())
         
-        if utilization['trade_utilization'] > 0.9:
-            score -= 15
-        elif utilization['trade_utilization'] > 0.8:
-            score -= 8
+        if total_var == 0:
+            return {strategy: 0.0 for strategy in individual_vars.keys()}
         
-        if utilization['capital_utilization'] > 0.9:
-            score -= 20
-        elif utilization['capital_utilization'] > 0.8:
-            score -= 10
+        # Simplified risk contribution calculation
+        for strategy in individual_vars.keys():
+            # Weight by individual VaR and average correlation
+            avg_correlation = self._get_average_correlation(strategy, correlation_matrix)
+            contribution = individual_vars[strategy] * avg_correlation / total_var
+            risk_contributions[strategy] = contribution
         
-        if utilization['delta_utilization'] > 0.9:
-            score -= 15
-        elif utilization['delta_utilization'] > 0.8:
-            score -= 8
+        return risk_contributions
+    
+    def _calculate_marginal_vars(
+        self,
+        individual_vars: Dict[str, float],
+        correlation_matrix: Dict[Tuple[str, str], float]
+    ) -> Dict[str, float]:
+        """Calculate marginal VaR of each strategy."""
         
-        # P&L impact
-        unrealized_pnl = float(position.get_total_unrealized_pnl())
-        nav = float(position.nav)
+        marginal_vars = {}
         
-        if unrealized_pnl < -nav * 0.1:  # > 10% loss
-            score -= 25
-        elif unrealized_pnl < -nav * 0.05:  # > 5% loss
-            score -= 15
-        elif unrealized_pnl < 0:  # Any loss
-            score -= 5
+        for strategy in individual_vars.keys():
+            # Simplified marginal VaR calculation
+            avg_correlation = self._get_average_correlation(strategy, correlation_matrix)
+            marginal_var = individual_vars[strategy] * avg_correlation
+            marginal_vars[strategy] = marginal_var
         
-        return max(0, score)
+        return marginal_vars
+    
+    def _get_average_correlation(
+        self,
+        strategy: str,
+        correlation_matrix: Dict[Tuple[str, str], float]
+    ) -> float:
+        """Get average correlation of strategy with all others."""
+        
+        correlations = []
+        
+        for key, correlation in correlation_matrix.items():
+            if strategy in key and key[0] != key[1]:  # Exclude self-correlation
+                correlations.append(correlation)
+        
+        return statistics.mean(correlations) if correlations else 0.0
+    
+    def _estimate_volatility(self, historical_data: List[OHLCVData]) -> float:
+        """Estimate historical volatility from price data."""
+        
+        if len(historical_data) < 20:
+            return 0.25  # Default 25%
+        
+        # Calculate daily returns
+        prices = [float(candle.close) for candle in historical_data[-60:]]  # Last 60 days
+        returns = []
+        
+        for i in range(1, len(prices)):
+            daily_return = math.log(prices[i] / prices[i-1])
+            returns.append(daily_return)
+        
+        if len(returns) < 2:
+            return 0.25
+        
+        # Annualized volatility
+        daily_vol = statistics.stdev(returns)
+        return daily_vol * math.sqrt(252)
+    
+    def _estimate_theta_decay(self, strategy: StrategyDefinition, days: int) -> float:
+        """Estimate theta decay over specified days."""
+        
+        # Simplified theta estimation
+        if not strategy.legs:
+            return 0.0
+        
+        total_theta = 0.0
+        
+        for leg in strategy.legs:
+            if leg.option.greeks and leg.option.greeks.theta:
+                leg_theta = float(leg.option.greeks.theta)
+                
+                # Apply direction (buy = negative theta, sell = positive theta)
+                if leg.direction.value == "BUY":
+                    leg_theta = -abs(leg_theta)
+                else:
+                    leg_theta = abs(leg_theta)
+                
+                total_theta += leg_theta * leg.quantity
+        
+        return total_theta * days

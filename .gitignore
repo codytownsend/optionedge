@@ -155,32 +155,75 @@ cython_debug/
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be added to the global gitignore or merged into this project gitignore.  For a PyCharm
-#  project, it is recommended to ignore the entire .idea/ directory.
+#  project, it is recommended to add the contents of this project's gitignore to the PyCharm
+#  gitignore.
+#  https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 .idea/
 
 # VS Code
 .vscode/
+*.code-workspace
 
-# Project-specific files
-logs/
-cache/
-temp/
-tmp/
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
 
-# Configuration files with secrets (keep .env.example)
+# Options Trading Engine Specific
+# =================================
+
+# Configuration files with sensitive data
 .env
+.env.local
+.env.prod
+.env.staging
+config/local_settings.yaml
+config/production_settings.yaml
+config/staging_settings.yaml
+
+# API Keys and Secrets
+api_keys.txt
+secrets.txt
+*.key
+*.pem
+*.p12
+*.pfx
 
 # Database files
 *.db
 *.sqlite
 *.sqlite3
+data/*.db
+data/*.sqlite
 
-# Generated API documentation
-api_docs/
+# Log files
+logs/
+*.log
+*.log.*
+log/
+
+# Data files
+data/cache/
+data/temp/
+data/raw/
+data/processed/
+data/external/
+data/interim/
+data/backups/
+*.csv
+*.xlsx
+*.xls
+*.json
+*.pickle
+*.pkl
+*.h5
+*.hdf5
+*.parquet
 
 # Backup files
-*.bak
 *.backup
+*.bak
+*.old
+*.tmp
 *~
 
 # OS generated files
@@ -192,26 +235,302 @@ api_docs/
 ehthumbs.db
 Thumbs.db
 
-# Options trading specific
-trades/
-portfolios/
-market_data/
-backtest_results/
+# IDE files
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+.metadata/
+.recommenders/
 
-# Jupyter notebook outputs
-*.ipynb
+# Docker
+Dockerfile.local
+docker-compose.override.yml
+.dockerignore.local
 
-# Profiling data
+# Redis dump
+dump.rdb
+
+# PostgreSQL
+*.pgsql
+*.psql
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Test files
+test_results/
+test_output/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Documentation build
+docs/_build/
+docs/build/
+site/
+
+# Profiling
 *.prof
 *.lprof
+*.py.prof
 
 # Memory profiling
 *.mprof
 
-# Custom cache directories
-.cache/
-.options_cache/
+# Coverage reports
+coverage/
+.coverage.*
+coverage.xml
+*.cover
 
-# API response cache
-api_cache/
-responses/
+# Security scans
+.bandit
+security_report.txt
+
+# Local development
+local/
+dev/
+sandbox/
+
+# Machine learning models
+models/
+*.model
+*.pkl
+*.joblib
+*.h5
+*.onnx
+*.pb
+*.pt
+*.pth
+
+# Monitoring and metrics
+metrics/
+monitoring/
+prometheus/
+grafana/
+
+# Deployment
+deploy/
+deployment/
+k8s/
+helm/
+terraform/
+ansible/
+
+# Certificates
+*.crt
+*.cert
+*.ca-bundle
+*.p7b
+*.p7s
+*.der
+
+# Environment-specific
+local_config.py
+local_settings.py
+dev_settings.py
+prod_settings.py
+
+# Cache directories
+.cache/
+cache/
+.redis/
+.memcached/
+
+# Backup directories
+backups/
+backup/
+*.backup
+
+# Performance test results
+performance/
+benchmarks/
+stress_test_results/
+
+# Trading specific
+positions/
+trades/
+portfolios/
+market_data/
+options_data/
+historical_data/
+backtesting_results/
+
+# Jupyter lab
+.jupyter/
+.ipython/
+
+# Experimental
+experiments/
+research/
+analysis/
+notebooks/output/
+
+# Third-party integrations
+third_party/
+integrations/
+plugins/
+
+# Generated files
+generated/
+auto_generated/
+*.generated.*
+
+# Runtime
+runtime/
+run/
+pid/
+*.pid
+*.lock
+
+# Sentry
+.sentryclirc
+
+# Linting
+.flake8
+.pylintrc
+.mypy_cache/
+.ruff_cache/
+
+# Pre-commit
+.pre-commit-config.yaml.backup
+
+# Node.js (if using any JS tools)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Yarn
+.yarn/
+.yarnrc.yml
+
+# Package manager
+Pipfile
+Pipfile.lock
+poetry.lock
+pdm.lock
+
+# Virtual environments
+.Python
+pyvenv.cfg
+pip-selfcheck.json
+
+# Local database
+*.db-journal
+*.db-shm
+*.db-wal
+
+# SQLite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+
+# Migrations
+migrations/versions/
+
+# Alembic
+alembic/versions/
+
+# Testing
+.pytest_cache/
+.testmondata
+
+# Sphinx
+docs/_build/
+docs/source/_autosummary/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Supervisor
+supervisord.log
+supervisord.pid
+
+# Gunicorn
+gunicorn.log
+gunicorn.pid
+
+# uWSGI
+uwsgi.log
+uwsgi.pid
+
+# Static files
+static/
+staticfiles/
+media/
+
+# Webpack
+webpack-stats.json
+
+# Sass
+.sass-cache/
+
+# Compass
+.compass/
+
+# macOS
+.AppleDouble
+.LSOverride
+Icon
+
+# Windows
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+
+# JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# NetBeans
+nbproject/private/
+build/
+nbbuild/
+dist/
+nbdist/
+.nb-gradle/
+
+# Gradle
+.gradle/
+build/
+
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar

@@ -1,718 +1,645 @@
 """
-Scoring engine service for ranking and evaluating trade candidates.
+Multi-factor scoring model for options strategy ranking and selection.
 """
 
-from abc import ABC, abstractmethod
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
-from typing import List, Dict, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
 from enum import Enum
-from dataclasses import dataclass
 import math
+import statistics
+import numpy as np
 import logging
 
-from ..entities.strategy import Strategy
-from ...data.models.trades import TradeCandidate, StrategyType
-from ...data.models.market_data import TechnicalIndicators, FundamentalData, EconomicIndicator
+from ...data.models.options import OptionQuote, OptionType, Greeks
+from ...data.models.market_data import StockQuote, TechnicalIndicators, FundamentalData, OHLCVData
+from ...data.models.trades import (
+    StrategyDefinition, TradeCandidate, TradeLeg, StrategyType
+)
+from ...infrastructure.error_handling import (
+    handle_errors, BusinessLogicError, CalculationError
+)
 
-logger = logging.getLogger(__name__)
-
-
-class ScoringFactorType(str, Enum):
-    """Types of scoring factors."""
-    PROBABILITY_OF_PROFIT = "probability_of_profit"
-    RETURN_ON_CAPITAL = "return_on_capital"
-    RISK_REWARD_RATIO = "risk_reward_ratio"
-    IMPLIED_VOLATILITY_RANK = "iv_rank"
-    MOMENTUM_SCORE = "momentum_score"
-    FLOW_SCORE = "flow_score"
-    LIQUIDITY_SCORE = "liquidity_score"
-    TIME_DECAY_SCORE = "time_decay_score"
-    TECHNICAL_SCORE = "technical_score"
-    FUNDAMENTAL_SCORE = "fundamental_score"
-    MARKET_REGIME_SCORE = "market_regime_score"
+from .constraint_engine import GICS_SECTORS
+from .dynamic_constraint_manager import MarketRegime, VolatilityRegime
 
 
-@dataclass
-class ScoringFactor:
-    """Individual scoring factor with weight and calculation method."""
-    
-    factor_type: ScoringFactorType
-    weight: float
-    enabled: bool = True
-    min_value: Optional[float] = None
-    max_value: Optional[float] = None
-    normalization_method: str = "linear"  # linear, logarithmic, sigmoid
-    
-    def __post_init__(self):
-        if not (0 <= self.weight <= 1):
-            raise ValueError(f"Weight must be between 0 and 1, got {self.weight}")
+class MarketRegimeType(Enum):
+    """Market regime types for scoring weight adjustments."""
+    HIGH_VOLATILITY = "high_volatility"
+    LOW_VOLATILITY = "low_volatility"
+    TRENDING_UP = "trending_up"
+    TRENDING_DOWN = "trending_down"
+    SIDEWAYS = "sideways"
+    CRISIS = "crisis"
 
 
 @dataclass
-class ScoringResult:
-    """Result of scoring a trade candidate."""
+class ScoringWeights:
+    """Scoring weights for different components."""
+    pop: float = 0.25           # Probability of profit weight
+    iv_rank: float = 0.20       # IV rank weight  
+    momentum: float = 0.20      # Momentum weight
+    flow: float = 0.15          # Flow weight
+    risk_reward: float = 0.15   # Risk/reward weight
+    liquidity: float = 0.05     # Liquidity weight
+
+
+@dataclass
+class ComponentScores:
+    """Individual component scores for a trade."""
+    pop_score: float
+    iv_rank_score: float
+    momentum_score: float
+    flow_score: float
+    risk_reward_score: float
+    liquidity_score: float
     
+    # Z-scores for ranking
+    momentum_z: float = 0.0
+    flow_z: float = 0.0
+    
+    # Calculated scores
+    model_score: float = 0.0
+    
+    # Supporting data
+    iv_current: Optional[float] = None
+    iv_rank: Optional[float] = None
+
+
+@dataclass
+class ScoredTradeCandidate:
+    """Trade candidate with comprehensive scoring."""
     trade_candidate: TradeCandidate
-    total_score: float
-    factor_scores: Dict[ScoringFactorType, float]
-    normalized_scores: Dict[ScoringFactorType, float]
-    warnings: List[str]
-    
-    def __post_init__(self):
-        if not self.warnings:
-            self.warnings = []
+    component_scores: ComponentScores
+    ranking_tier: int = 1  # 1 = highest tier
+    ranking_rationale: str = ""
 
 
-class ScoringModel:
-    """
-    Configurable scoring model for trade evaluation.
-    
-    Allows customization of scoring factors, weights, and calculation methods
-    to adapt to different market conditions and trading strategies.
-    """
-    
-    def __init__(self, name: str, factors: List[ScoringFactor]):
-        self.name = name
-        self.factors = {factor.factor_type: factor for factor in factors}
-        self._validate_weights()
-    
-    def _validate_weights(self):
-        """Validate that weights sum to approximately 1.0."""
-        total_weight = sum(factor.weight for factor in self.factors.values() if factor.enabled)
-        if not (0.95 <= total_weight <= 1.05):  # Allow small rounding errors
-            logger.warning(f"Scoring model '{self.name}' weights sum to {total_weight:.3f}, not 1.0")
-    
-    def get_enabled_factors(self) -> List[ScoringFactor]:
-        """Get list of enabled scoring factors."""
-        return [factor for factor in self.factors.values() if factor.enabled]
-    
-    def update_factor_weight(self, factor_type: ScoringFactorType, new_weight: float):
-        """Update weight for a specific factor."""
-        if factor_type in self.factors:
-            self.factors[factor_type].weight = new_weight
-            self._validate_weights()
-    
-    def enable_factor(self, factor_type: ScoringFactorType, enabled: bool = True):
-        """Enable or disable a scoring factor."""
-        if factor_type in self.factors:
-            self.factors[factor_type].enabled = enabled
-
-
-class TradeScorer:
-    """
-    Service for scoring individual trade candidates.
-    
-    Calculates scores for various factors and combines them according
-    to the specified scoring model.
-    """
-    
-    def __init__(self, scoring_model: ScoringModel):
-        self.scoring_model = scoring_model
-        self._factor_calculators = {
-            ScoringFactorType.PROBABILITY_OF_PROFIT: self._calculate_pop_score,
-            ScoringFactorType.RETURN_ON_CAPITAL: self._calculate_roc_score,
-            ScoringFactorType.RISK_REWARD_RATIO: self._calculate_risk_reward_score,
-            ScoringFactorType.IMPLIED_VOLATILITY_RANK: self._calculate_iv_rank_score,
-            ScoringFactorType.MOMENTUM_SCORE: self._calculate_momentum_score,
-            ScoringFactorType.FLOW_SCORE: self._calculate_flow_score,
-            ScoringFactorType.LIQUIDITY_SCORE: self._calculate_liquidity_score,
-            ScoringFactorType.TIME_DECAY_SCORE: self._calculate_time_decay_score,
-            ScoringFactorType.TECHNICAL_SCORE: self._calculate_technical_score,
-            ScoringFactorType.FUNDAMENTAL_SCORE: self._calculate_fundamental_score,
-            ScoringFactorType.MARKET_REGIME_SCORE: self._calculate_market_regime_score,
-        }
-    
-    def score_trade(self, 
-                   trade_candidate: TradeCandidate,
-                   technical_indicators: Optional[TechnicalIndicators] = None,
-                   fundamental_data: Optional[FundamentalData] = None,
-                   market_context: Optional[Dict[str, Any]] = None) -> ScoringResult:
-        """
-        Score a trade candidate using the configured scoring model.
-        
-        Args:
-            trade_candidate: Trade to score
-            technical_indicators: Technical analysis data
-            fundamental_data: Fundamental analysis data
-            market_context: Additional market context data
-            
-        Returns:
-            Comprehensive scoring result
-        """
-        factor_scores = {}
-        normalized_scores = {}
-        warnings = []
-        
-        # Calculate raw scores for each enabled factor
-        for factor in self.scoring_model.get_enabled_factors():
-            try:
-                calculator = self._factor_calculators.get(factor.factor_type)
-                if calculator:
-                    raw_score = calculator(
-                        trade_candidate, technical_indicators, fundamental_data, market_context
-                    )
-                    
-                    if raw_score is not None:
-                        factor_scores[factor.factor_type] = raw_score
-                        normalized_score = self._normalize_score(raw_score, factor)
-                        normalized_scores[factor.factor_type] = normalized_score
-                    else:
-                        warnings.append(f"Could not calculate {factor.factor_type.value}")
-                else:
-                    warnings.append(f"No calculator for {factor.factor_type.value}")
-                    
-            except Exception as e:
-                logger.warning(f"Error calculating {factor.factor_type.value}: {e}")
-                warnings.append(f"Error in {factor.factor_type.value}: {str(e)}")
-        
-        # Calculate weighted total score
-        total_score = 0.0
-        total_weight = 0.0
-        
-        for factor in self.scoring_model.get_enabled_factors():
-            if factor.factor_type in normalized_scores:
-                weighted_score = normalized_scores[factor.factor_type] * factor.weight
-                total_score += weighted_score
-                total_weight += factor.weight
-        
-        # Normalize by total weight if not exactly 1.0
-        if total_weight > 0 and total_weight != 1.0:
-            total_score = total_score / total_weight
-        
-        return ScoringResult(
-            trade_candidate=trade_candidate,
-            total_score=total_score,
-            factor_scores=factor_scores,
-            normalized_scores=normalized_scores,
-            warnings=warnings
-        )
-    
-    def _normalize_score(self, raw_score: float, factor: ScoringFactor) -> float:
-        """Normalize raw score to 0-1 range."""
-        if factor.normalization_method == "linear":
-            if factor.min_value is not None and factor.max_value is not None:
-                if factor.max_value == factor.min_value:
-                    return 1.0
-                normalized = (raw_score - factor.min_value) / (factor.max_value - factor.min_value)
-                return max(0.0, min(1.0, normalized))
-            else:
-                # Default linear normalization for 0-1 range
-                return max(0.0, min(1.0, raw_score))
-        
-        elif factor.normalization_method == "sigmoid":
-            # Sigmoid normalization
-            return 1 / (1 + math.exp(-raw_score))
-        
-        elif factor.normalization_method == "logarithmic":
-            # Logarithmic normalization
-            if raw_score <= 0:
-                return 0.0
-            log_score = math.log(1 + raw_score)
-            return min(1.0, log_score / 5.0)  # Normalize to roughly 0-1 range
-        
-        else:
-            return raw_score
-    
-    def _calculate_pop_score(self, 
-                           trade_candidate: TradeCandidate,
-                           technical_indicators: Optional[TechnicalIndicators],
-                           fundamental_data: Optional[FundamentalData],
-                           market_context: Optional[Dict[str, Any]]) -> Optional[float]:
-        """Calculate probability of profit score."""
-        return trade_candidate.probability_of_profit
-    
-    def _calculate_roc_score(self,
-                           trade_candidate: TradeCandidate,
-                           technical_indicators: Optional[TechnicalIndicators],
-                           fundamental_data: Optional[FundamentalData],
-                           market_context: Optional[Dict[str, Any]]) -> Optional[float]:
-        """Calculate return on capital score."""
-        return trade_candidate.strategy.calculate_return_on_capital()
-    
-    def _calculate_risk_reward_score(self,
-                                   trade_candidate: TradeCandidate,
-                                   technical_indicators: Optional[TechnicalIndicators],
-                                   fundamental_data: Optional[FundamentalData],
-                                   market_context: Optional[Dict[str, Any]]) -> Optional[float]:
-        """Calculate risk-reward ratio score (inverted - lower is better)."""
-        risk_reward = trade_candidate.strategy.get_risk_reward_ratio()
-        if risk_reward is None or risk_reward <= 0:
-            return None
-        
-        # Invert the ratio (lower risk/reward is better)
-        # Score ranges from 0 to 1, where 1 is best
-        optimal_ratio = 2.0  # Optimal risk/reward ratio
-        if risk_reward <= optimal_ratio:
-            return 1.0
-        else:
-            # Exponential decay for ratios above optimal
-            return math.exp(-(risk_reward - optimal_ratio) / optimal_ratio)
-    
-    def _calculate_iv_rank_score(self,
-                               trade_candidate: TradeCandidate,
-                               technical_indicators: Optional[TechnicalIndicators],
-                               fundamental_data: Optional[FundamentalData],
-                               market_context: Optional[Dict[str, Any]]) -> Optional[float]:
-        """Calculate implied volatility rank score."""
-        return trade_candidate.iv_rank
-    
-    def _calculate_momentum_score(self,
-                                trade_candidate: TradeCandidate,
-                                technical_indicators: Optional[TechnicalIndicators],
-                                fundamental_data: Optional[FundamentalData],
-                                market_context: Optional[Dict[str, Any]]) -> Optional[float]:
-        """Calculate momentum score from technical indicators."""
-        if not technical_indicators:
-            return trade_candidate.momentum_z_score
-        
-        # Combine multiple momentum indicators
-        momentum_scores = []
-        
-        # Short-term momentum
-        if technical_indicators.momentum_1d is not None:
-            momentum_scores.append(technical_indicators.momentum_1d / 10.0)  # Normalize
-        
-        if technical_indicators.momentum_5d is not None:
-            momentum_scores.append(technical_indicators.momentum_5d / 20.0)  # Normalize
-        
-        # RSI momentum
-        if technical_indicators.rsi_14 is not None:
-            rsi = technical_indicators.rsi_14
-            # Convert RSI to momentum score (50 is neutral)
-            rsi_momentum = (rsi - 50) / 50  # Range: -1 to 1
-            momentum_scores.append(rsi_momentum)
-        
-        if momentum_scores:
-            return sum(momentum_scores) / len(momentum_scores)
-        
-        return trade_candidate.momentum_z_score
-    
-    def _calculate_flow_score(self,
-                            trade_candidate: TradeCandidate,
-                            technical_indicators: Optional[TechnicalIndicators],
-                            fundamental_data: Optional[FundamentalData],
-                            market_context: Optional[Dict[str, Any]]) -> Optional[float]:
-        """Calculate flow score."""
-        return trade_candidate.flow_z_score
-    
-    def _calculate_liquidity_score(self,
-                                 trade_candidate: TradeCandidate,
-                                 technical_indicators: Optional[TechnicalIndicators],
-                                 fundamental_data: Optional[FundamentalData],
-                                 market_context: Optional[Dict[str, Any]]) -> Optional[float]:
-        """Calculate liquidity score based on option liquidity."""
-        if not trade_candidate.liquidity_score:
-            # Calculate from strategy legs
-            total_score = 0.0
-            leg_count = 0
-            
-            for leg in trade_candidate.strategy.legs:
-                option = leg.option
-                leg_score = 0.0
-                
-                # Volume component (0-0.4)
-                volume = option.volume or 0
-                if volume >= 100:
-                    leg_score += 0.4
-                elif volume >= 50:
-                    leg_score += 0.3
-                elif volume >= 10:
-                    leg_score += 0.2
-                
-                # Open interest component (0-0.4)
-                oi = option.open_interest or 0
-                if oi >= 1000:
-                    leg_score += 0.4
-                elif oi >= 500:
-                    leg_score += 0.3
-                elif oi >= 100:
-                    leg_score += 0.2
-                
-                # Spread component (0-0.2)
-                spread_pct = option.bid_ask_spread_percent or 1.0
-                if spread_pct <= 0.05:
-                    leg_score += 0.2
-                elif spread_pct <= 0.15:
-                    leg_score += 0.15
-                elif spread_pct <= 0.35:
-                    leg_score += 0.1
-                
-                total_score += leg_score
-                leg_count += 1
-            
-            return total_score / leg_count if leg_count > 0 else 0.0
-        
-        return trade_candidate.liquidity_score
-    
-    def _calculate_time_decay_score(self,
-                                  trade_candidate: TradeCandidate,
-                                  technical_indicators: Optional[TechnicalIndicators],
-                                  fundamental_data: Optional[FundamentalData],
-                                  market_context: Optional[Dict[str, Any]]) -> Optional[float]:
-        """Calculate time decay score based on theta and days to expiration."""
-        strategy = trade_candidate.strategy
-        
-        # Get net theta
-        net_theta = strategy.calculate_net_greeks().theta
-        days_to_exp = strategy.get_days_to_expiration()
-        
-        if net_theta is None or days_to_exp <= 0:
-            return None
-        
-        # For credit strategies, positive theta is good
-        # For debit strategies, negative theta is bad
-        if strategy.is_credit_strategy():
-            # Positive theta is good for credit strategies
-            theta_score = max(0, net_theta / 100.0)  # Normalize
-        else:
-            # Negative theta is bad for debit strategies
-            theta_score = max(0, -net_theta / 100.0)  # Invert and normalize
-        
-        # Days to expiration factor (sweet spot around 20-35 days)
-        if 20 <= days_to_exp <= 35:
-            dte_factor = 1.0
-        elif 15 <= days_to_exp < 20 or 35 < days_to_exp <= 45:
-            dte_factor = 0.8
-        elif 7 <= days_to_exp < 15:
-            dte_factor = 0.6
-        else:
-            dte_factor = 0.4
-        
-        return theta_score * dte_factor
-    
-    def _calculate_technical_score(self,
-                                 trade_candidate: TradeCandidate,
-                                 technical_indicators: Optional[TechnicalIndicators],
-                                 fundamental_data: Optional[FundamentalData],
-                                 market_context: Optional[Dict[str, Any]]) -> Optional[float]:
-        """Calculate technical analysis score."""
-        if not technical_indicators:
-            return None
-        
-        scores = []
-        
-        # Trend strength (moving averages)
-        if all(ma is not None for ma in [technical_indicators.sma_20, technical_indicators.sma_50]):
-            sma_20 = float(technical_indicators.sma_20)
-            sma_50 = float(technical_indicators.sma_50)
-            
-            # Trend score based on MA relationship
-            if sma_20 > sma_50:
-                trend_score = 0.6  # Uptrend
-            else:
-                trend_score = 0.4  # Downtrend
-            
-            scores.append(trend_score)
-        
-        # Volatility score
-        if technical_indicators.hv_30 is not None:
-            hv = technical_indicators.hv_30
-            # Moderate volatility is preferred (15-30%)
-            if 15 <= hv <= 30:
-                vol_score = 1.0
-            elif 10 <= hv < 15 or 30 < hv <= 40:
-                vol_score = 0.8
-            elif 5 <= hv < 10 or 40 < hv <= 60:
-                vol_score = 0.6
-            else:
-                vol_score = 0.4
-            
-            scores.append(vol_score)
-        
-        # RSI score (avoid extreme readings)
-        if technical_indicators.rsi_14 is not None:
-            rsi = technical_indicators.rsi_14
-            if 40 <= rsi <= 60:
-                rsi_score = 1.0  # Neutral territory
-            elif 30 <= rsi < 40 or 60 < rsi <= 70:
-                rsi_score = 0.8
-            elif 20 <= rsi < 30 or 70 < rsi <= 80:
-                rsi_score = 0.6
-            else:
-                rsi_score = 0.4  # Extreme readings
-            
-            scores.append(rsi_score)
-        
-        return sum(scores) / len(scores) if scores else None
-    
-    def _calculate_fundamental_score(self,
-                                   trade_candidate: TradeCandidate,
-                                   technical_indicators: Optional[TechnicalIndicators],
-                                   fundamental_data: Optional[FundamentalData],
-                                   market_context: Optional[Dict[str, Any]]) -> Optional[float]:
-        """Calculate fundamental analysis score."""
-        if not fundamental_data:
-            return None
-        
-        scores = []
-        
-        # Profitability score
-        if fundamental_data.net_margin is not None:
-            margin = fundamental_data.net_margin
-            if margin > 0.15:  # > 15%
-                margin_score = 1.0
-            elif margin > 0.10:  # > 10%
-                margin_score = 0.8
-            elif margin > 0.05:  # > 5%
-                margin_score = 0.6
-            elif margin > 0:
-                margin_score = 0.4
-            else:
-                margin_score = 0.2  # Unprofitable
-            
-            scores.append(margin_score)
-        
-        # Valuation score (P/E ratio)
-        if fundamental_data.pe_ratio is not None and fundamental_data.pe_ratio > 0:
-            pe = fundamental_data.pe_ratio
-            if 10 <= pe <= 20:
-                pe_score = 1.0  # Reasonable valuation
-            elif 5 <= pe < 10 or 20 < pe <= 30:
-                pe_score = 0.8
-            elif pe < 5 or 30 < pe <= 50:
-                pe_score = 0.6
-            else:
-                pe_score = 0.4  # Extreme valuation
-            
-            scores.append(pe_score)
-        
-        # Growth score (PEG ratio)
-        if fundamental_data.peg_ratio is not None and fundamental_data.peg_ratio > 0:
-            peg = fundamental_data.peg_ratio
-            if 0.5 <= peg <= 1.5:
-                peg_score = 1.0  # Good growth at reasonable price
-            elif 0.2 <= peg < 0.5 or 1.5 < peg <= 2.5:
-                peg_score = 0.8
-            else:
-                peg_score = 0.6
-            
-            scores.append(peg_score)
-        
-        return sum(scores) / len(scores) if scores else None
-    
-    def _calculate_market_regime_score(self,
-                                     trade_candidate: TradeCandidate,
-                                     technical_indicators: Optional[TechnicalIndicators],
-                                     fundamental_data: Optional[FundamentalData],
-                                     market_context: Optional[Dict[str, Any]]) -> Optional[float]:
-        """Calculate market regime score based on current market conditions."""
-        if not market_context:
-            return None
-        
-        # This would analyze current market regime (bull, bear, sideways)
-        # and score strategies based on their suitability for the regime
-        
-        market_regime = market_context.get('regime', 'neutral')
-        strategy_type = trade_candidate.strategy_type
-        
-        # Strategy suitability by market regime
-        regime_scores = {
-            'bull': {
-                StrategyType.PUT_CREDIT_SPREAD: 0.9,
-                StrategyType.CALL_CREDIT_SPREAD: 0.3,
-                StrategyType.IRON_CONDOR: 0.5,
-                StrategyType.COVERED_CALL: 0.7,
-            },
-            'bear': {
-                StrategyType.PUT_CREDIT_SPREAD: 0.3,
-                StrategyType.CALL_CREDIT_SPREAD: 0.9,
-                StrategyType.IRON_CONDOR: 0.5,
-                StrategyType.COVERED_CALL: 0.4,
-            },
-            'neutral': {
-                StrategyType.PUT_CREDIT_SPREAD: 0.6,
-                StrategyType.CALL_CREDIT_SPREAD: 0.6,
-                StrategyType.IRON_CONDOR: 0.9,
-                StrategyType.COVERED_CALL: 0.7,
-            }
-        }
-        
-        return regime_scores.get(market_regime, {}).get(strategy_type, 0.5)
+# Sector ETF mapping for flow calculations
+SECTOR_ETF_MAP = {
+    "Information Technology": "XLK",
+    "Health Care": "XLV", 
+    "Financials": "XLF",
+    "Consumer Discretionary": "XLY",
+    "Communication Services": "XLC",
+    "Industrials": "XLI",
+    "Consumer Staples": "XLP",
+    "Energy": "XLE",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE",
+    "Materials": "XLB"
+}
 
 
 class ScoringEngine:
     """
-    Main scoring engine that orchestrates trade evaluation and ranking.
+    Multi-factor scoring model for options strategies with dynamic weight allocation.
     
-    Provides high-level interface for scoring multiple trade candidates
-    and ranking them according to specified criteria.
+    Features:
+    - Composite scoring system with 6 primary components
+    - Dynamic weight adjustments based on market regime
+    - Momentum and flow Z-score calculations
+    - IV rank scoring with historical analysis
+    - Risk/reward ratio optimization
+    - Liquidity quality assessment
+    - Market regime-based weight rebalancing
     """
     
-    def __init__(self, default_model: Optional[ScoringModel] = None):
-        self.default_model = default_model or self._create_default_model()
-        self.trade_scorer = TradeScorer(self.default_model)
+    def __init__(self):
+        self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
+        
+        # Base scoring weights
+        self.base_weights = ScoringWeights()
+        
+        # Market regime weight adjustments
+        self.regime_adjustments = {
+            MarketRegimeType.HIGH_VOLATILITY: {
+                'iv_rank': 1.3,
+                'momentum': 0.7,
+                'pop': 1.1
+            },
+            MarketRegimeType.LOW_VOLATILITY: {
+                'momentum': 1.3,
+                'flow': 1.2,
+                'iv_rank': 0.8,
+                'risk_reward': 1.1
+            },
+            MarketRegimeType.TRENDING_UP: {
+                'momentum': 1.4,
+                'pop': 0.9,
+                'flow': 1.2
+            },
+            MarketRegimeType.TRENDING_DOWN: {
+                'pop': 1.3,
+                'momentum': 0.7,
+                'risk_reward': 1.2
+            },
+            MarketRegimeType.SIDEWAYS: {
+                'pop': 1.2,
+                'risk_reward': 1.1,
+                'liquidity': 1.1
+            },
+            MarketRegimeType.CRISIS: {
+                'pop': 1.5,
+                'liquidity': 1.3,
+                'iv_rank': 0.8,
+                'momentum': 0.6
+            }
+        }
     
-    def score_trades(self,
-                    trade_candidates: List[TradeCandidate],
-                    technical_data: Optional[Dict[str, TechnicalIndicators]] = None,
-                    fundamental_data: Optional[Dict[str, FundamentalData]] = None,
-                    market_context: Optional[Dict[str, Any]] = None) -> List[ScoringResult]:
+    @handle_errors(operation_name="calculate_model_score")
+    def calculate_model_score(
+        self,
+        trade_candidate: TradeCandidate,
+        market_data: Dict[str, Any],
+        historical_data: Optional[Dict[str, List[OHLCVData]]] = None,
+        market_regime: Optional[MarketRegimeType] = None
+    ) -> ScoredTradeCandidate:
         """
-        Score multiple trade candidates.
+        Calculate composite model score for a trade candidate.
         
         Args:
-            trade_candidates: List of trades to score
-            technical_data: Technical indicators by symbol
-            fundamental_data: Fundamental data by symbol
-            market_context: Market context information
+            trade_candidate: Trade candidate to score
+            market_data: Current market data context
+            historical_data: Historical price data for calculations
+            market_regime: Current market regime
             
         Returns:
-            List of scoring results, sorted by score (highest first)
+            Scored trade candidate with component breakdown
         """
-        results = []
+        strategy = trade_candidate.strategy
+        ticker = strategy.underlying
+        
+        self.logger.debug(f"Calculating model score for {ticker} {strategy.strategy_type.value}")
+        
+        # Calculate component scores
+        pop_score = self._normalize_pop_score(strategy.probability_of_profit)
+        iv_rank_score = self._calculate_iv_rank_score(ticker, market_data, historical_data)
+        momentum_score, momentum_z = self._calculate_momentum_score(ticker, historical_data)
+        flow_score, flow_z = self._calculate_flow_score(ticker, market_data)
+        risk_reward_score = self._calculate_risk_reward_score(strategy)
+        liquidity_score = self._calculate_liquidity_score(strategy.legs)
+        
+        # Get weights adjusted for market regime
+        weights = self._adjust_weights_for_regime(self.base_weights, market_regime)
+        
+        # Calculate composite model score
+        model_score = (
+            pop_score * weights.pop +
+            iv_rank_score * weights.iv_rank +
+            momentum_score * weights.momentum +
+            flow_score * weights.flow +
+            risk_reward_score * weights.risk_reward +
+            liquidity_score * weights.liquidity
+        )
+        
+        # Create component scores object
+        component_scores = ComponentScores(
+            pop_score=pop_score,
+            iv_rank_score=iv_rank_score,
+            momentum_score=momentum_score,
+            flow_score=flow_score,
+            risk_reward_score=risk_reward_score,
+            liquidity_score=liquidity_score,
+            momentum_z=momentum_z,
+            flow_z=flow_z,
+            model_score=round(model_score, 2)
+        )
+        
+        # Determine ranking tier and rationale
+        ranking_tier = self._determine_ranking_tier(model_score, component_scores)
+        ranking_rationale = self._generate_ranking_rationale(component_scores, weights, market_regime)
+        
+        return ScoredTradeCandidate(
+            trade_candidate=trade_candidate,
+            component_scores=component_scores,
+            ranking_tier=ranking_tier,
+            ranking_rationale=ranking_rationale
+        )
+    
+    @handle_errors(operation_name="batch_score_trades")
+    def batch_score_trades(
+        self,
+        trade_candidates: List[TradeCandidate],
+        market_data: Dict[str, Any],
+        historical_data: Optional[Dict[str, List[OHLCVData]]] = None,
+        market_regime: Optional[MarketRegimeType] = None
+    ) -> List[ScoredTradeCandidate]:
+        """
+        Score multiple trade candidates in batch.
+        
+        Args:
+            trade_candidates: List of trade candidates to score
+            market_data: Current market data context
+            historical_data: Historical price data
+            market_regime: Current market regime
+            
+        Returns:
+            List of scored trade candidates sorted by model score
+        """
+        self.logger.info(f"Batch scoring {len(trade_candidates)} trade candidates")
+        
+        scored_candidates = []
         
         for candidate in trade_candidates:
-            symbol = candidate.underlying
-            
-            # Get data for this symbol
-            tech_indicators = technical_data.get(symbol) if technical_data else None
-            fund_data = fundamental_data.get(symbol) if fundamental_data else None
-            
-            # Score the trade
-            result = self.trade_scorer.score_trade(
-                candidate, tech_indicators, fund_data, market_context
-            )
-            
-            # Update the trade candidate with the score
-            candidate.model_score = result.total_score
-            
-            results.append(result)
+            try:
+                scored_candidate = self.calculate_model_score(
+                    candidate, market_data, historical_data, market_regime
+                )
+                scored_candidates.append(scored_candidate)
+            except Exception as e:
+                self.logger.warning(f"Failed to score {candidate.strategy.underlying}: {str(e)}")
+                # Add with default score
+                default_scores = ComponentScores(
+                    pop_score=0, iv_rank_score=0, momentum_score=0,
+                    flow_score=0, risk_reward_score=0, liquidity_score=0,
+                    model_score=0.0
+                )
+                scored_candidates.append(ScoredTradeCandidate(
+                    trade_candidate=candidate,
+                    component_scores=default_scores,
+                    ranking_tier=5,
+                    ranking_rationale="Scoring failed - assigned default values"
+                ))
         
-        # Sort by total score (highest first)
-        results.sort(key=lambda x: x.total_score, reverse=True)
+        # Sort by model score (highest first)
+        scored_candidates.sort(key=lambda x: x.component_scores.model_score, reverse=True)
         
-        return results
+        self.logger.info(f"Completed batch scoring. Top score: {scored_candidates[0].component_scores.model_score if scored_candidates else 0}")
+        
+        return scored_candidates
     
-    def rank_trades(self, scoring_results: List[ScoringResult]) -> List[TradeCandidate]:
-        """
-        Rank trades based on scoring results with tie-breaking.
+    def _normalize_pop_score(self, pop: Optional[float]) -> float:
+        """Convert POP to 0-100 score."""
+        if not pop:
+            return 0.0
         
-        Args:
-            scoring_results: List of scoring results
-            
-        Returns:
-            Ranked list of trade candidates
-        """
-        # Sort with tie-breaking rules
-        def sort_key(result: ScoringResult):
-            candidate = result.trade_candidate
-            
-            # Primary: total score
-            primary = result.total_score
-            
-            # Secondary: momentum Z-score
-            secondary = candidate.momentum_z_score or 0
-            
-            # Tertiary: flow Z-score
-            tertiary = candidate.flow_z_score or 0
-            
-            return (primary, secondary, tertiary)
+        # Linear scaling from minimum viable POP (0.65) to perfect (1.0)
+        if pop < 0.65:
+            return 0.0
         
-        sorted_results = sorted(scoring_results, key=sort_key, reverse=True)
-        
-        # Extract trade candidates and assign ranks
-        ranked_trades = []
-        for i, result in enumerate(sorted_results):
-            candidate = result.trade_candidate
-            candidate.rank = i + 1
-            ranked_trades.append(candidate)
-        
-        return ranked_trades
+        return ((pop - 0.65) / 0.35) * 100
     
-    def update_scoring_model(self, new_model: ScoringModel):
-        """Update the scoring model."""
-        self.default_model = new_model
-        self.trade_scorer = TradeScorer(new_model)
+    def _calculate_iv_rank_score(
+        self,
+        ticker: str,
+        market_data: Dict[str, Any],
+        historical_data: Optional[Dict[str, List[OHLCVData]]]
+    ) -> float:
+        """Calculate IV Rank score based on current IV vs historical range."""
+        
+        # Get current IV from market data
+        ticker_data = market_data.get(ticker, {})
+        iv_current = ticker_data.get('implied_volatility')
+        
+        if not iv_current:
+            return 50.0  # Neutral score if no IV data
+        
+        # Get historical IV data or estimate from price volatility
+        iv_history = self._get_iv_history(ticker, market_data, historical_data)
+        
+        if len(iv_history) < 50:
+            return 50.0  # Neutral score if insufficient history
+        
+        # Calculate IV rank (percentile)
+        iv_rank = self._calculate_percentile(iv_history, iv_current)
+        
+        # For credit strategies, high IV rank is favorable (selling premium)
+        # For debit strategies, low IV rank is favorable (buying cheap options)
+        
+        # Most strategies in our system are credit strategies, so favor high IV rank
+        return iv_rank
     
-    def _create_default_model(self) -> ScoringModel:
-        """Create default scoring model."""
-        factors = [
-            ScoringFactor(
-                factor_type=ScoringFactorType.PROBABILITY_OF_PROFIT,
-                weight=0.25,
-                min_value=0.0,
-                max_value=1.0
-            ),
-            ScoringFactor(
-                factor_type=ScoringFactorType.RETURN_ON_CAPITAL,
-                weight=0.20,
-                min_value=0.0,
-                max_value=2.0  # 200% annualized return cap
-            ),
-            ScoringFactor(
-                factor_type=ScoringFactorType.RISK_REWARD_RATIO,
-                weight=0.15,
-                normalization_method="sigmoid"
-            ),
-            ScoringFactor(
-                factor_type=ScoringFactorType.IMPLIED_VOLATILITY_RANK,
-                weight=0.10,
-                min_value=0.0,
-                max_value=1.0
-            ),
-            ScoringFactor(
-                factor_type=ScoringFactorType.LIQUIDITY_SCORE,
-                weight=0.10,
-                min_value=0.0,
-                max_value=1.0
-            ),
-            ScoringFactor(
-                factor_type=ScoringFactorType.TIME_DECAY_SCORE,
-                weight=0.10,
-                min_value=0.0,
-                max_value=1.0
-            ),
-            ScoringFactor(
-                factor_type=ScoringFactorType.MOMENTUM_SCORE,
-                weight=0.05,
-                normalization_method="sigmoid"
-            ),
-            ScoringFactor(
-                factor_type=ScoringFactorType.FLOW_SCORE,
-                weight=0.05,
-                normalization_method="sigmoid"
-            )
+    def _calculate_momentum_score(
+        self,
+        ticker: str,
+        historical_data: Optional[Dict[str, List[OHLCVData]]]
+    ) -> Tuple[float, float]:
+        """Calculate momentum score and Z-score."""
+        
+        if not historical_data or ticker not in historical_data:
+            return 50.0, 0.0  # Neutral score and Z-score
+        
+        price_data = historical_data[ticker]
+        if len(price_data) < 21:  # Need at least 21 days for 20-day momentum
+            return 50.0, 0.0
+        
+        # Calculate momentum Z-score
+        momentum_z = self._calculate_momentum_z_score(price_data)
+        
+        # Convert Z-score to 0-100 score
+        # Z-scores typically range -3 to +3, normalize to 0-100
+        # Positive momentum generally favored
+        normalized_score = 50 + (momentum_z * 16.67)  # 16.67 = 50/3
+        momentum_score = max(0, min(100, normalized_score))
+        
+        return momentum_score, momentum_z
+    
+    def _calculate_flow_score(
+        self,
+        ticker: str,
+        market_data: Dict[str, Any]
+    ) -> Tuple[float, float]:
+        """Calculate flow score and Z-score."""
+        
+        # Calculate flow Z-score
+        flow_z = self._calculate_flow_z_score(ticker, market_data)
+        
+        # Convert Z-score to 0-100 score
+        # Similar to momentum, positive flow favored
+        normalized_score = 50 + (flow_z * 16.67)
+        flow_score = max(0, min(100, normalized_score))
+        
+        return flow_score, flow_z
+    
+    def _calculate_risk_reward_score(self, strategy: StrategyDefinition) -> float:
+        """Calculate risk/reward ratio score."""
+        
+        if not strategy.max_loss or strategy.max_loss <= 0:
+            return 0.0
+        
+        # For credit strategies, higher credit relative to max loss is better
+        if strategy.net_credit and strategy.net_credit > 0:
+            ratio = float(strategy.net_credit) / float(strategy.max_loss)
+            # Scale ratio (0.33 minimum to 1.0 maximum) to 0-100
+            score = ((ratio - 0.33) / 0.67) * 100
+        elif strategy.max_profit:
+            # For other strategies, use profit potential
+            ratio = float(strategy.max_profit) / float(strategy.max_loss)
+            score = min(ratio * 25, 100)  # Cap at 100
+        else:
+            return 0.0
+        
+        return max(0, min(100, score))
+    
+    def _calculate_liquidity_score(self, legs: List[TradeLeg]) -> float:
+        """Calculate liquidity quality score."""
+        
+        if not legs:
+            return 0.0
+        
+        total_score = 0.0
+        
+        for leg in legs:
+            option = leg.option
+            leg_score = 0.0
+            
+            # Open interest component (0-40 points)
+            if option.open_interest:
+                oi_score = min(option.open_interest / 1000 * 40, 40)
+                leg_score += oi_score
+            
+            # Bid-ask spread component (0-40 points)
+            if option.bid and option.ask and option.bid > 0 and option.ask > 0:
+                mid_price = (option.bid + option.ask) / 2
+                spread_pct = (option.ask - option.bid) / mid_price if mid_price > 0 else 1
+                spread_score = max(0, 40 * (1 - spread_pct * 20))  # Penalize wide spreads
+                leg_score += spread_score
+            
+            # Volume component (0-20 points)
+            if option.volume:
+                volume_score = min(option.volume / 100 * 20, 20)
+                leg_score += volume_score
+            
+            total_score += leg_score
+        
+        # Average across legs
+        return total_score / len(legs)
+    
+    def _calculate_momentum_z_score(self, price_data: List[OHLCVData]) -> float:
+        """Calculate standardized momentum score."""
+        
+        if len(price_data) < 272:  # Need 252 + 21 for full calculation
+            return 0.0
+        
+        # Get prices
+        prices = [float(candle.close) for candle in price_data]
+        
+        # Calculate current 20-day momentum
+        current_price = prices[-1]
+        price_20d_ago = prices[-21]
+        momentum_20d = (current_price / price_20d_ago) - 1
+        
+        # Calculate historical momentum data (252 trading days = 1 year)
+        historical_momentum = []
+        for i in range(252, len(prices)):
+            hist_momentum = (prices[i] / prices[i-20]) - 1
+            historical_momentum.append(hist_momentum)
+        
+        if len(historical_momentum) < 50:  # Need sufficient history
+            return 0.0
+        
+        # Calculate Z-score
+        mean_momentum = statistics.mean(historical_momentum)
+        std_momentum = statistics.stdev(historical_momentum) if len(historical_momentum) > 1 else 0
+        
+        if std_momentum == 0:
+            return 0.0
+        
+        momentum_z = (momentum_20d - mean_momentum) / std_momentum
+        
+        # Cap extreme values
+        return max(-3.0, min(3.0, momentum_z))
+    
+    def _calculate_flow_z_score(self, ticker: str, market_data: Dict[str, Any]) -> float:
+        """Calculate flow Z-score from ETF and options flow."""
+        
+        # Get sector ETF for the ticker
+        sector = GICS_SECTORS.get(ticker, "Unknown")
+        sector_etf = SECTOR_ETF_MAP.get(sector, "SPY")
+        
+        # ETF flow component
+        etf_flow_data = market_data.get('etf_flows', {})
+        etf_flows = etf_flow_data.get(sector_etf, [])
+        
+        if len(etf_flows) >= 20:
+            current_flow = etf_flows[-1] if etf_flows else 0
+            historical_flows = etf_flows[-252:] if len(etf_flows) >= 252 else etf_flows
+            
+            if len(historical_flows) > 1:
+                flow_mean = statistics.mean(historical_flows)
+                flow_std = statistics.stdev(historical_flows)
+                etf_flow_z = (current_flow - flow_mean) / flow_std if flow_std > 0 else 0
+            else:
+                etf_flow_z = 0
+        else:
+            etf_flow_z = 0
+        
+        # Options flow component (put/call ratio, unusual volume)
+        options_flow_data = market_data.get('options_flows', {})
+        ticker_options_flows = options_flow_data.get(ticker, {})
+        
+        put_call_ratio = ticker_options_flows.get('put_call_ratio', 1.0)
+        volume_ratio = ticker_options_flows.get('volume_vs_oi_ratio', 1.0)
+        
+        # Convert put/call ratio to flow signal (low P/C = bullish flow)
+        pc_signal = -math.log(max(0.1, put_call_ratio))  # Negative log for inverse relationship
+        
+        # Volume vs OI ratio signal (high ratio = new interest)
+        volume_signal = math.log(max(0.1, volume_ratio))
+        
+        # Combine flow signals (weight ETF flow more heavily)
+        combined_flow_z = (0.6 * etf_flow_z + 0.25 * pc_signal + 0.15 * volume_signal)
+        
+        # Cap extreme values
+        return max(-3.0, min(3.0, combined_flow_z))
+    
+    def _get_iv_history(
+        self,
+        ticker: str,
+        market_data: Dict[str, Any],
+        historical_data: Optional[Dict[str, List[OHLCVData]]]
+    ) -> List[float]:
+        """Get historical IV data or estimate from price volatility."""
+        
+        # Try to get actual IV history from market data
+        iv_history_data = market_data.get('iv_history', {})
+        if ticker in iv_history_data:
+            return iv_history_data[ticker]
+        
+        # Fall back to estimated IV from historical price volatility
+        if historical_data and ticker in historical_data:
+            price_data = historical_data[ticker]
+            if len(price_data) >= 252:  # 1 year of data
+                return self._estimate_iv_from_prices(price_data)
+        
+        return []
+    
+    def _estimate_iv_from_prices(self, price_data: List[OHLCVData]) -> List[float]:
+        """Estimate implied volatility from historical price movements."""
+        
+        prices = [float(candle.close) for candle in price_data]
+        iv_estimates = []
+        
+        # Use 20-day rolling volatility as IV proxy
+        for i in range(20, len(prices)):
+            recent_prices = prices[i-20:i]
+            returns = []
+            for j in range(1, len(recent_prices)):
+                daily_return = math.log(recent_prices[j] / recent_prices[j-1])
+                returns.append(daily_return)
+            
+            if len(returns) > 1:
+                daily_vol = statistics.stdev(returns)
+                annualized_vol = daily_vol * math.sqrt(252)
+                iv_estimates.append(annualized_vol)
+        
+        return iv_estimates
+    
+    def _calculate_percentile(self, data: List[float], value: float) -> float:
+        """Calculate percentile rank of value in data."""
+        
+        if not data:
+            return 50.0
+        
+        sorted_data = sorted(data)
+        n = len(sorted_data)
+        
+        # Find position of value
+        count_below = sum(1 for x in sorted_data if x < value)
+        count_equal = sum(1 for x in sorted_data if x == value)
+        
+        # Calculate percentile rank
+        percentile = (count_below + 0.5 * count_equal) / n * 100
+        
+        return percentile
+    
+    def _adjust_weights_for_regime(
+        self,
+        base_weights: ScoringWeights,
+        market_regime: Optional[MarketRegimeType]
+    ) -> ScoringWeights:
+        """Adjust scoring weights based on market conditions."""
+        
+        if not market_regime:
+            return base_weights
+        
+        # Get regime adjustments
+        adjustments = self.regime_adjustments.get(market_regime, {})
+        
+        # Apply adjustments
+        adjusted_weights = ScoringWeights(
+            pop=base_weights.pop * adjustments.get('pop', 1.0),
+            iv_rank=base_weights.iv_rank * adjustments.get('iv_rank', 1.0),
+            momentum=base_weights.momentum * adjustments.get('momentum', 1.0),
+            flow=base_weights.flow * adjustments.get('flow', 1.0),
+            risk_reward=base_weights.risk_reward * adjustments.get('risk_reward', 1.0),
+            liquidity=base_weights.liquidity * adjustments.get('liquidity', 1.0)
+        )
+        
+        # Renormalize weights to sum to 1.0
+        total_weight = (adjusted_weights.pop + adjusted_weights.iv_rank + 
+                       adjusted_weights.momentum + adjusted_weights.flow + 
+                       adjusted_weights.risk_reward + adjusted_weights.liquidity)
+        
+        if total_weight > 0:
+            adjusted_weights.pop /= total_weight
+            adjusted_weights.iv_rank /= total_weight
+            adjusted_weights.momentum /= total_weight
+            adjusted_weights.flow /= total_weight
+            adjusted_weights.risk_reward /= total_weight
+            adjusted_weights.liquidity /= total_weight
+        
+        return adjusted_weights
+    
+    def _determine_ranking_tier(self, model_score: float, component_scores: ComponentScores) -> int:
+        """Determine ranking tier based on model score and components."""
+        
+        if model_score >= 80:
+            return 1  # Tier 1: Excellent
+        elif model_score >= 65:
+            return 2  # Tier 2: Good
+        elif model_score >= 50:
+            return 3  # Tier 3: Average
+        elif model_score >= 35:
+            return 4  # Tier 4: Below Average
+        else:
+            return 5  # Tier 5: Poor
+    
+    def _generate_ranking_rationale(
+        self,
+        scores: ComponentScores,
+        weights: ScoringWeights,
+        market_regime: Optional[MarketRegimeType]
+    ) -> str:
+        """Generate human-readable ranking rationale."""
+        
+        rationale_parts = []
+        
+        # Identify strongest components
+        component_values = [
+            ("POP", scores.pop_score),
+            ("IV Rank", scores.iv_rank_score),
+            ("Momentum", scores.momentum_score),
+            ("Flow", scores.flow_score),
+            ("Risk/Reward", scores.risk_reward_score),
+            ("Liquidity", scores.liquidity_score)
         ]
         
-        return ScoringModel("default", factors)
-
-
-# Predefined scoring models for different scenarios
-class ScoringModelFactory:
-    """Factory for creating predefined scoring models."""
-    
-    @staticmethod
-    def create_conservative_model() -> ScoringModel:
-        """Create scoring model optimized for conservative trading."""
-        factors = [
-            ScoringFactor(ScoringFactorType.PROBABILITY_OF_PROFIT, weight=0.35),
-            ScoringFactor(ScoringFactorType.RISK_REWARD_RATIO, weight=0.25),
-            ScoringFactor(ScoringFactorType.LIQUIDITY_SCORE, weight=0.20),
-            ScoringFactor(ScoringFactorType.RETURN_ON_CAPITAL, weight=0.20),
-        ]
-        return ScoringModel("conservative", factors)
-    
-    @staticmethod
-    def create_aggressive_model() -> ScoringModel:
-        """Create scoring model optimized for aggressive trading."""
-        factors = [
-            ScoringFactor(ScoringFactorType.RETURN_ON_CAPITAL, weight=0.30),
-            ScoringFactor(ScoringFactorType.MOMENTUM_SCORE, weight=0.25),
-            ScoringFactor(ScoringFactorType.PROBABILITY_OF_PROFIT, weight=0.20),
-            ScoringFactor(ScoringFactorType.IMPLIED_VOLATILITY_RANK, weight=0.15),
-            ScoringFactor(ScoringFactorType.FLOW_SCORE, weight=0.10),
-        ]
-        return ScoringModel("aggressive", factors)
-    
-    @staticmethod
-    def create_income_model() -> ScoringModel:
-        """Create scoring model optimized for income generation."""
-        factors = [
-            ScoringFactor(ScoringFactorType.TIME_DECAY_SCORE, weight=0.30),
-            ScoringFactor(ScoringFactorType.PROBABILITY_OF_PROFIT, weight=0.25),
-            ScoringFactor(ScoringFactorType.RETURN_ON_CAPITAL, weight=0.20),
-            ScoringFactor(ScoringFactorType.LIQUIDITY_SCORE, weight=0.15),
-            ScoringFactor(ScoringFactorType.IMPLIED_VOLATILITY_RANK, weight=0.10),
-        ]
-        return ScoringModel("income", factors)
+        # Sort by score
+        component_values.sort(key=lambda x: x[1], reverse=True)
+        
+        # Mention top 2 components
+        if component_values[0][1] > 70:
+            rationale_parts.append(f"Strong {component_values[0][0]} ({component_values[0][1]:.0f})")
+        
+        if component_values[1][1] > 60:
+            rationale_parts.append(f"Good {component_values[1][0]} ({component_values[1][1]:.0f})")
+        
+        # Mention market regime if applicable
+        if market_regime:
+            regime_name = market_regime.value.replace('_', ' ').title()
+            rationale_parts.append(f"{regime_name} conditions")
+        
+        # Add momentum/flow Z-scores if significant
+        if abs(scores.momentum_z) > 1.5:
+            direction = "positive" if scores.momentum_z > 0 else "negative"
+            rationale_parts.append(f"{direction} momentum ({scores.momentum_z:.1f}σ)")
+        
+        if abs(scores.flow_z) > 1.5:
+            direction = "positive" if scores.flow_z > 0 else "negative"
+            rationale_parts.append(f"{direction} flow ({scores.flow_z:.1f}σ)")
+        
+        return "; ".join(rationale_parts) if rationale_parts else "Standard scoring criteria applied"

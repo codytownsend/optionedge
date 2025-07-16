@@ -1,0 +1,438 @@
+Project Architecture & Design Principles
+Core Design Philosophy
+
+Modularity: Each component should be independently testable and replaceable
+Data-Driven: All decisions based on quantifiable metrics and constraints
+Fault Tolerance: System should gracefully handle API failures and data gaps
+Scalability: Architecture should support expanding to more tickers and strategies
+Auditability: Every trade recommendation should be traceable and explainable
+
+High-Level System Architecture
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Data Layer    │    │  Business Logic │    │  Output Layer   │
+│                 │    │                 │    │                 │
+│ • API Managers  │───▶│ • Strategy Gen  │───▶│ • Formatters    │
+│ • Data Models   │    │ • Filtering     │    │ • Validators    │
+│ • Caching       │    │ • Scoring       │    │ • Exporters     │
+│ • Validation    │    │ • Selection     │    │                 │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+         │                       │                       │
+         ▼                       ▼                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Configuration & Orchestration                │
+│  • User Settings • Risk Parameters • Execution Engine          │
+└─────────────────────────────────────────────────────────────────┘
+Phase 1: Foundation & Data Infrastructure (Weeks 1-2)
+1.1 Project Setup & Environment Configuration
+Development Environment Setup
+
+Create virtual environment with Python 3.9+
+Establish directory structure following clean architecture principles
+Set up logging framework with multiple output levels
+Configure environment variable management for API keys
+Establish code formatting standards and linting rules
+Set up version control with meaningful commit message structure
+
+Directory Structure Design
+options_engine/
+├── src/
+│   ├── data/           # Data layer components
+│   ├── domain/         # Business logic and models
+│   ├── infrastructure/ # External service integrations
+│   ├── application/    # Use cases and orchestration
+│   └── presentation/   # Output formatting and interfaces
+├── tests/              # Comprehensive test suite
+├── config/             # Configuration files and schemas
+├── docs/               # Technical and user documentation
+└── scripts/            # Utility and deployment scripts
+1.2 Configuration Management System
+User Configuration Schema
+
+Portfolio parameters: NAV, available capital, risk tolerance
+Market scanning preferences: universe selection, sector preferences
+Time constraints: expiration windows, quote freshness requirements
+Strategy preferences: allowed strategies, Greeks limits
+Output preferences: formatting options, notification settings
+
+System Configuration Management
+
+API endpoint configurations with fallback hierarchies
+Rate limiting parameters per data source
+Caching policies and data retention rules
+Error handling thresholds and retry logic parameters
+Performance monitoring and alerting thresholds
+
+1.3 Data Models & Schema Design
+Core Entity Models
+
+Ticker Profile: Symbol, sector classification, market cap, optionability status
+Options Contract: Complete contract specification with all Greeks and market data
+Strategy Definition: Abstract representation of multi-leg options strategies
+Trade Candidate: Specific implementable trade with risk metrics
+Market Data Point: Timestamped market information with quality indicators
+
+Data Validation Framework
+
+Input sanitization for all external data sources
+Business rule validation for calculated metrics
+Data freshness and quality scoring mechanisms
+Anomaly detection for outlier identification
+Cross-validation between multiple data sources
+
+1.4 API Integration Foundation
+API Management Architecture
+
+Abstract base classes for all external data providers
+Standardized request/response handling with automatic retries
+Rate limiting implementation respecting provider constraints
+Circuit breaker pattern for failing services
+Comprehensive request/response logging for debugging
+
+Data Source Prioritization Strategy
+
+Primary sources: Tradier (options), Yahoo Finance (fundamentals)
+Secondary sources: Alpha Vantage, Polygon, IEX Cloud
+Tertiary sources: Scraped data, alternative data providers
+Fallback mechanisms when primary sources are unavailable
+Data source health monitoring and automatic failover
+
+Phase 2: Options Data Collection & Processing (Weeks 2-3)
+2.1 Options Chain Data Management
+Comprehensive Options Data Retrieval
+
+Full options chain extraction for all expiration cycles
+Real-time bid/ask spread monitoring and quality assessment
+Greeks calculation verification using multiple methodologies
+Open interest and volume trend analysis
+Strike ladder completeness validation and gap identification
+
+Data Quality Assurance Framework
+
+Quote age verification with automatic rejection of stale data
+Bid/ask spread reasonableness checks (reject if spread > 50% of mid)
+Volume and open interest consistency validation
+Greeks mathematical validation using Black-Scholes verification
+Cross-exchange data comparison for accuracy confirmation
+
+2.2 Fundamental Data Integration
+Financial Metrics Collection Strategy
+
+Quarterly and annual financial statement data extraction
+Forward-looking estimates and guidance information
+Insider trading activity monitoring and trend analysis
+Institutional ownership changes and 13F filing analysis
+Credit rating changes and debt structure monitoring
+
+Data Normalization and Standardization
+
+Consistent financial metric calculation across all tickers
+Industry-adjusted ratio calculations for comparative analysis
+Historical trend analysis with seasonal adjustment factors
+Forward-looking metric estimation using regression models
+Outlier detection and data quality scoring for fundamental metrics
+
+2.3 Technical Analysis Engine
+Price and Volume Analytics
+
+Multi-timeframe moving average calculations with adaptive periods
+Momentum indicators with volatility-adjusted parameters
+Volume profile analysis and institutional flow detection
+Support and resistance level identification using multiple methods
+Volatility regime classification and trend strength measurement
+
+Advanced Technical Indicators
+
+Historical volatility calculations across multiple timeframes
+Relative strength analysis versus sector and market benchmarks
+Mean reversion probability estimation using statistical models
+Breakout probability assessment using price pattern recognition
+Volume-weighted average price calculations with institutional bias detection
+
+Phase 3: Strategy Generation & Greeks Management (Weeks 3-4)
+3.1 Options Strategy Framework
+Multi-Strategy Generation Engine
+
+Credit spread optimization across all viable strike combinations
+Iron condor construction with dynamic wing selection
+Covered call and cash-secured put strategy generation
+Calendar spread identification using volatility term structure
+Diagonal spread construction with time decay optimization
+
+Strategy Parameter Optimization
+
+Strike selection using probability-weighted expected returns
+Expiration date optimization balancing time decay and event risk
+Position sizing calculation based on Kelly criterion and risk parity
+Greeks-neutral strategy construction for market-neutral approaches
+Volatility arbitrage opportunity identification
+
+3.2 Probability Calculations
+Probability of Profit Modeling
+
+Monte Carlo simulation using multiple volatility models
+Historical simulation using empirical price distributions
+Black-Scholes analytical solutions with volatility smile adjustments
+Implied volatility surface modeling for accurate pricing
+Early assignment probability estimation for American-style options
+
+Risk Metric Calculations
+
+Maximum loss scenarios under various market stress conditions
+Breakeven point analysis with probability distributions
+Expected value calculations incorporating all possible outcomes
+Value at Risk and Conditional Value at Risk measurements
+Sharpe ratio and risk-adjusted return estimations
+
+3.3 Portfolio Greeks Management
+Individual Trade Greeks Analysis
+
+Delta exposure calculation with hedge ratio implications
+Gamma risk assessment for directional exposure changes
+Theta decay analysis with time-to-expiration considerations
+Vega exposure evaluation for volatility sensitivity
+Rho interest rate sensitivity for longer-dated strategies
+
+Portfolio-Level Greeks Aggregation
+
+Net delta calculation with position weighting
+Aggregate gamma exposure with convexity risk assessment
+Combined theta decay with income generation analysis
+Total vega exposure with volatility clustering considerations
+Portfolio correlation effects on individual position Greeks
+
+Phase 4: Filtering & Constraint Engine (Weeks 4-5)
+4.1 Hard Constraint Implementation
+Trade Viability Filtering
+
+Minimum bid/ask spread requirements for execution feasibility
+Minimum open interest thresholds for liquidity assurance
+Maximum quote age restrictions for current market conditions
+Position size limits based on available capital and margin requirements
+Expiration date constraints aligned with user preferences
+
+Risk Management Constraints
+
+Maximum loss per trade as percentage of portfolio NAV
+Probability of profit minimum thresholds with confidence intervals
+Credit-to-max-loss ratio requirements for favorable risk/reward
+Concentration limits preventing over-exposure to single positions
+Sector diversification requirements with GICS classification enforcement
+
+4.2 Portfolio-Level Risk Controls
+Greeks-Based Portfolio Constraints
+
+Net delta limits preventing excessive directional bias
+Maximum vega exposure to control volatility risk
+Gamma limits to prevent excessive convexity exposure
+Theta targets for consistent income generation
+Cross-position correlation analysis for risk reduction
+
+Capital Allocation Framework
+
+Available buying power calculation including margin requirements
+Position size optimization using modern portfolio theory
+Risk budget allocation across different strategy types
+Liquidity requirements for position entry and exit
+Stress testing under various market scenarios
+
+4.3 Market Condition Adaptability
+Dynamic Constraint Adjustment
+
+Volatility regime detection with parameter adjustments
+Market stress indicators with tightened risk controls
+Liquidity condition monitoring with execution probability assessment
+Economic event calendar integration with position timing
+Earnings announcement proximity with strategy modification
+
+Phase 5: Scoring & Ranking Engine (Weeks 5-6)
+5.1 Multi-Factor Scoring Model
+Primary Scoring Components
+
+Probability of profit weighting with confidence interval adjustments
+Risk-adjusted return calculations using Sharpe-like ratios
+Implied volatility rank percentile with historical context
+Technical momentum scoring with multiple timeframe analysis
+Fundamental strength assessment with peer comparison
+
+Advanced Scoring Factors
+
+Market microstructure quality indicators (bid/ask efficiency)
+Liquidity depth assessment for execution quality
+Volatility surface arbitrage opportunities
+Cross-asset correlation benefits for portfolio construction
+Event risk proximity with probability-weighted adjustments
+
+5.2 Dynamic Weight Allocation
+Market Regime-Based Weighting
+
+Bull market emphasis on momentum and growth factors
+Bear market focus on defensive strategies and credit quality
+Sideways market prioritization of theta-generating strategies
+High volatility periods emphasizing volatility arbitrage
+Low volatility regimes focusing on volatility selling strategies
+
+Adaptive Model Parameters
+
+Historical performance backtesting with rolling window analysis
+Machine learning model training for factor weight optimization
+Market condition clustering for regime-specific parameters
+Performance attribution analysis for continuous improvement
+Overfitting prevention through cross-validation techniques
+
+5.3 Tie-Breaking and Final Selection
+Ranking Hierarchy Implementation
+
+Primary ranking by composite model score
+Secondary ranking by momentum Z-score for trend confirmation
+Tertiary ranking by flow Z-score for institutional interest
+Final tie-breaking using trade execution feasibility metrics
+Manual override capabilities for qualitative adjustments
+
+Phase 6: Output Generation & Validation (Weeks 6-7)
+6.1 Trade Recommendation Formatting
+Structured Output Generation
+
+Fixed-width table formatting for console compatibility
+Standardized strategy naming conventions for clarity
+Concise thesis generation using natural language processing
+Risk metric display with appropriate precision
+Execution timing recommendations with market hour considerations
+
+Quality Assurance Checks
+
+Mathematical consistency verification across all displayed metrics
+Strategy implementability confirmation with current market conditions
+Risk parameter validation against user-defined constraints
+Thesis accuracy verification against underlying analysis
+Output formatting consistency across different terminal environments
+
+6.2 Trade Validation Framework
+Pre-Output Validation
+
+Real-time market data verification before final recommendation
+Strategy leg availability confirmation across multiple exchanges
+Margin requirement calculations for execution feasibility
+Commission and fee impact analysis on strategy profitability
+Regulatory compliance checks for retail trading restrictions
+
+Post-Generation Quality Control
+
+Cross-validation of displayed metrics against source calculations
+Strategy replication verification using independent pricing models
+Risk scenario testing for edge case identification
+Performance expectation reality testing against historical data
+User experience testing for output clarity and actionability
+
+Phase 7: Testing & Quality Assurance (Weeks 7-8)
+7.1 Comprehensive Testing Strategy
+Unit Testing Framework
+
+Individual function testing with comprehensive edge case coverage
+Mathematical accuracy verification for all calculations
+Data validation testing with malformed input scenarios
+API integration testing with mock responses and error conditions
+Performance testing for individual components under load
+
+Integration Testing Implementation
+
+End-to-end workflow testing with real market data
+Cross-component data flow verification
+Error propagation testing through the entire system
+API failure simulation and recovery testing
+Memory and resource usage testing under various load conditions
+
+7.2 Market Simulation Testing
+Historical Data Backtesting
+
+Strategy performance validation using historical market conditions
+Risk metric accuracy verification against actual outcomes
+Model score predictive power assessment over time
+Parameter sensitivity analysis under different market regimes
+Overfitting detection through out-of-sample testing
+
+Stress Testing Scenarios
+
+Market crash simulation with liquidity constraints
+High volatility period testing with expanded bid/ask spreads
+Low liquidity market testing with reduced available strategies
+API outage simulation with degraded data quality
+Extreme market condition testing with tail risk scenarios
+
+Phase 8: Performance Optimization & Monitoring (Week 8)
+8.1 System Performance Enhancement
+Computational Optimization
+
+API call optimization with intelligent caching strategies
+Parallel processing implementation for independent calculations
+Memory usage optimization for large dataset processing
+Database query optimization for historical data retrieval
+Algorithm efficiency improvements for real-time processing
+
+Monitoring and Alerting Infrastructure
+
+Real-time performance monitoring with threshold alerting
+Data quality monitoring with automatic degradation detection
+API health monitoring with service status dashboards
+Trade recommendation quality tracking with success metrics
+System resource utilization monitoring with capacity planning
+
+8.2 Continuous Improvement Framework
+Performance Metrics Collection
+
+Trade recommendation accuracy tracking over time
+Strategy performance attribution analysis
+Model predictive power assessment with rolling evaluations
+User satisfaction metrics collection and analysis
+System reliability metrics with uptime tracking
+
+Feedback Loop Implementation
+
+Actual trade outcome tracking for model improvement
+User feedback collection for feature enhancement priorities
+Market condition adaptability assessment with parameter tuning
+Competitive analysis for feature gap identification
+Technology stack evaluation for optimization opportunities
+
+Risk Management & Error Handling Strategy
+Data Risk Mitigation
+
+Multiple data source validation with consensus mechanisms
+Outlier detection and automatic data cleaning procedures
+Data staleness detection with automatic refresh triggers
+Cross-validation between different data providers
+Manual override capabilities for data quality issues
+
+Operational Risk Controls
+
+Comprehensive logging with structured error categorization
+Graceful degradation when non-critical components fail
+User notification system for system status and limitations
+Backup data source activation procedures
+Emergency system shutdown procedures for critical failures
+
+Financial Risk Safeguards
+
+Position sizing limits with hard stops
+Maximum loss calculations with stress scenario testing
+Liquidity requirement verification before recommendations
+Margin calculation accuracy with broker integration
+Regulatory compliance monitoring with automatic updates
+
+Documentation & Deployment Requirements
+Technical Documentation
+
+Complete API documentation with usage examples
+Configuration guide with parameter explanations
+Troubleshooting guide with common issue resolutions
+Performance tuning guide with optimization recommendations
+Integration guide for extending functionality
+
+User Documentation
+
+Quick start guide with minimal configuration requirements
+Strategy explanation guide with risk/reward profiles
+Output interpretation guide with metric definitions
+Best practices guide for optimal system usage
+FAQ compilation with common user questions
+
+This blueprint provides the comprehensive framework needed to build a professional-grade options trade discovery engine. Each phase builds upon the previous ones, with clear deliverables and validation criteria. The modular design ensures that components can be developed and tested independently while maintaining system-wide coherence and reliability.

@@ -1,1 +1,3 @@
-"""Integration tests for API integrations."""
+"""
+Integration tests for API clients.
+"""

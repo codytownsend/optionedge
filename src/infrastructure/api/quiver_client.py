@@ -1,498 +1,364 @@
 """
-QuiverQuant API client for alternative data and sentiment analysis.
+QuiverQuant API client for alternative data (sentiment, flow, insider trading).
 """
 
-import logging
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 from typing import Dict, Any, Optional, List
 
-from .base_client import BaseAPIClient, APIError, DataValidator
-from ...data.models.market_data import SentimentData
-
-logger = logging.getLogger(__name__)
+from .base_client import BaseAPIClient, RateLimitConfig, CircuitBreakerConfig
+from ...data.models.market_data import SentimentData, ETFFlowData
 
 
 class QuiverQuantClient(BaseAPIClient):
-    """QuiverQuant API client for alternative data sources."""
+    """
+    QuiverQuant API client implementation.
     
-    def __init__(self, 
-                 api_key: str,
-                 **kwargs):
-        """
-        Initialize QuiverQuant client.
+    API Documentation: https://www.quiverquant.com/docs/
+    Base URL: https://api.quiverquant.com/beta/
+    Authentication: Bearer token in header
+    Rate Limit: 100 requests/minute
+    """
+    
+    def __init__(self, api_key: str):
+        rate_limit_config = RateLimitConfig(
+            requests_per_minute=100,
+            requests_per_hour=None,
+            burst_allowance=10
+        )
         
-        Args:
-            api_key: QuiverQuant API key
-            **kwargs: Additional arguments for base client
-        """
+        circuit_breaker_config = CircuitBreakerConfig(
+            failure_threshold=5,
+            timeout_seconds=60,
+            half_open_max_calls=3
+        )
+        
         super().__init__(
-            base_url="https://api.quiverquant.com",
+            base_url="https://api.quiverquant.com/beta",
             api_key=api_key,
-            rate_limit_per_minute=60,  # QuiverQuant rate limit
-            **kwargs
+            rate_limit_config=rate_limit_config,
+            circuit_breaker_config=circuit_breaker_config,
+            timeout=30,
+            max_retries=3
         )
     
-    def _get_default_headers(self) -> Dict[str, str]:
-        """Get default headers for QuiverQuant API."""
+    def authenticate(self) -> Dict[str, str]:
+        """Return authentication headers for QuiverQuant API."""
         return {
-            'Authorization': f'Bearer {self.api_key}',
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+            "User-Agent": "OptionsEngine/1.0"
         }
     
-    def _validate_response(self, response) -> bool:
-        """Validate QuiverQuant API response."""
+    def get_provider_name(self) -> str:
+        """Return the name of the data provider."""
+        return "QuiverQuant"
+    
+    def health_check(self) -> bool:
+        """Perform health check using a simple endpoint."""
         try:
-            data = response.json()
-            
-            # Check for API errors
-            if isinstance(data, dict):
-                if 'error' in data:
-                    logger.error(f"QuiverQuant API error: {data['error']}")
-                    return False
-                
-                if 'message' in data and 'error' in data.get('message', '').lower():
-                    logger.error(f"QuiverQuant API message: {data['message']}")
-                    return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Response validation failed: {e}")
+            # Try to get recent congressional trading data (should always have data)
+            response = self.get("live/congresstrading")
+            return isinstance(response, list)
+        except Exception:
             return False
     
-    def get_reddit_sentiment(self, 
-                           symbol: str,
-                           lookback_days: int = 7) -> Optional[SentimentData]:
+    def get_reddit_sentiment(self, symbol: str, days: int = 30) -> Optional[SentimentData]:
         """
         Get Reddit sentiment data for a symbol.
         
         Args:
             symbol: Stock symbol
-            lookback_days: Number of days to look back
+            days: Number of days of data to retrieve
             
         Returns:
-            SentimentData object or None if not found
+            SentimentData object or None
         """
-        params = {
-            'symbol': symbol.upper(),
-            'days': lookback_days
-        }
-        
         try:
-            response_data = self.get('/beta/social/reddit', params=params)
-            return self._parse_reddit_sentiment(symbol, response_data)
+            response = self.get(f"live/wallstreetbets/{symbol}")
+            
+            if not response or not isinstance(response, list):
+                self.logger.warning(f"No Reddit sentiment data found for {symbol}")
+                return None
+            
+            # Get recent data within the specified days
+            cutoff_date = datetime.now() - timedelta(days=days)
+            recent_posts = [
+                post for post in response 
+                if datetime.fromisoformat(post.get("Date", "").replace("Z", "+00:00")) > cutoff_date
+            ]
+            
+            if not recent_posts:
+                return None
+            
+            # Calculate aggregate sentiment
+            total_sentiment = 0
+            total_mentions = 0
+            
+            for post in recent_posts:
+                sentiment = post.get("Sentiment", 0)
+                if sentiment is not None:
+                    total_sentiment += sentiment
+                    total_mentions += 1
+            
+            if total_mentions == 0:
+                return None
+            
+            avg_sentiment = total_sentiment / total_mentions
+            
+            return SentimentData(
+                symbol=symbol,
+                timestamp=datetime.utcnow(),
+                reddit_sentiment=max(-1.0, min(1.0, avg_sentiment)),  # Clamp to [-1, 1]
+                mention_count=total_mentions,
+                overall_sentiment=max(-1.0, min(1.0, avg_sentiment))
+            )
             
         except Exception as e:
-            logger.error(f"Failed to get Reddit sentiment for {symbol}: {e}")
+            self.logger.error(f"Failed to get Reddit sentiment for {symbol}: {str(e)}")
             return None
     
-    def get_twitter_sentiment(self, 
-                            symbol: str,
-                            lookback_days: int = 7) -> Optional[SentimentData]:
+    def get_insider_trading(self, symbol: str, days: int = 90) -> Optional[float]:
         """
-        Get Twitter sentiment data for a symbol.
+        Get insider trading sentiment for a symbol.
         
         Args:
             symbol: Stock symbol
-            lookback_days: Number of days to look back
+            days: Number of days of data to analyze
             
         Returns:
-            SentimentData object or None if not found
-        """
-        params = {
-            'symbol': symbol.upper(),
-            'days': lookback_days
-        }
-        
-        try:
-            response_data = self.get('/beta/social/twitter', params=params)
-            return self._parse_twitter_sentiment(symbol, response_data)
-            
-        except Exception as e:
-            logger.error(f"Failed to get Twitter sentiment for {symbol}: {e}")
-            return None
-    
-    def get_insider_trading(self, 
-                          symbol: str,
-                          lookback_days: int = 30) -> List[Dict[str, Any]]:
-        """
-        Get insider trading data for a symbol.
-        
-        Args:
-            symbol: Stock symbol
-            lookback_days: Number of days to look back
-            
-        Returns:
-            List of insider trading transactions
-        """
-        params = {
-            'symbol': symbol.upper(),
-            'days': lookback_days
-        }
-        
-        try:
-            response_data = self.get('/beta/historical/insider-trading', params=params)
-            return self._parse_insider_trading(response_data)
-            
-        except Exception as e:
-            logger.error(f"Failed to get insider trading for {symbol}: {e}")
-            return []
-    
-    def get_congress_trading(self, 
-                           symbol: str,
-                           lookback_days: int = 90) -> List[Dict[str, Any]]:
-        """
-        Get congressional trading data for a symbol.
-        
-        Args:
-            symbol: Stock symbol
-            lookback_days: Number of days to look back
-            
-        Returns:
-            List of congressional trading transactions
-        """
-        params = {
-            'symbol': symbol.upper(),
-            'days': lookback_days
-        }
-        
-        try:
-            response_data = self.get('/beta/historical/congress-trading', params=params)
-            return self._parse_congress_trading(response_data)
-            
-        except Exception as e:
-            logger.error(f"Failed to get congress trading for {symbol}: {e}")
-            return []
-    
-    def get_institutional_holdings(self, 
-                                 symbol: str) -> List[Dict[str, Any]]:
-        """
-        Get institutional holdings data for a symbol.
-        
-        Args:
-            symbol: Stock symbol
-            
-        Returns:
-            List of institutional holdings
-        """
-        params = {'symbol': symbol.upper()}
-        
-        try:
-            response_data = self.get('/beta/historical/institutional-holdings', params=params)
-            return self._parse_institutional_holdings(response_data)
-            
-        except Exception as e:
-            logger.error(f"Failed to get institutional holdings for {symbol}: {e}")
-            return []
-    
-    def get_analyst_ratings(self, 
-                          symbol: str,
-                          lookback_days: int = 90) -> List[Dict[str, Any]]:
-        """
-        Get analyst ratings and price targets for a symbol.
-        
-        Args:
-            symbol: Stock symbol
-            lookback_days: Number of days to look back
-            
-        Returns:
-            List of analyst ratings
-        """
-        params = {
-            'symbol': symbol.upper(),
-            'days': lookback_days
-        }
-        
-        try:
-            response_data = self.get('/beta/historical/analyst-ratings', params=params)
-            return self._parse_analyst_ratings(response_data)
-            
-        except Exception as e:
-            logger.error(f"Failed to get analyst ratings for {symbol}: {e}")
-            return []
-    
-    def get_options_flow(self, 
-                       symbol: str,
-                       lookback_days: int = 7) -> List[Dict[str, Any]]:
-        """
-        Get options flow data for a symbol.
-        
-        Args:
-            symbol: Stock symbol
-            lookback_days: Number of days to look back
-            
-        Returns:
-            List of options flow transactions
-        """
-        params = {
-            'symbol': symbol.upper(),
-            'days': lookback_days
-        }
-        
-        try:
-            response_data = self.get('/beta/historical/options-flow', params=params)
-            return self._parse_options_flow(response_data)
-            
-        except Exception as e:
-            logger.error(f"Failed to get options flow for {symbol}: {e}")
-            return []
-    
-    def get_comprehensive_sentiment(self, 
-                                  symbol: str,
-                                  lookback_days: int = 7) -> Optional[SentimentData]:
-        """
-        Get comprehensive sentiment data from multiple sources.
-        
-        Args:
-            symbol: Stock symbol
-            lookback_days: Number of days to look back
-            
-        Returns:
-            Combined SentimentData object
+            Insider sentiment score (-1 to 1) or None
         """
         try:
-            # Get sentiment from multiple sources
-            reddit_sentiment = self.get_reddit_sentiment(symbol, lookback_days)
-            twitter_sentiment = self.get_twitter_sentiment(symbol, lookback_days)
+            response = self.get(f"live/insidertrading/{symbol}")
             
-            # Combine sentiment data
-            overall_sentiment = None
-            mention_count = 0
+            if not response or not isinstance(response, list):
+                self.logger.warning(f"No insider trading data found for {symbol}")
+                return None
             
-            if reddit_sentiment and twitter_sentiment:
-                # Average the sentiments
-                reddit_score = reddit_sentiment.reddit_sentiment or 0
-                twitter_score = twitter_sentiment.twitter_sentiment or 0
-                overall_sentiment = (reddit_score + twitter_score) / 2
+            # Filter recent trades
+            cutoff_date = datetime.now() - timedelta(days=days)
+            recent_trades = [
+                trade for trade in response
+                if datetime.strptime(trade.get("Date", ""), "%Y-%m-%d") > cutoff_date.replace(tzinfo=None)
+            ]
+            
+            if not recent_trades:
+                return None
+            
+            # Calculate sentiment based on buy/sell ratio and amounts
+            total_buy_value = 0
+            total_sell_value = 0
+            
+            for trade in recent_trades:
+                transaction_type = trade.get("Transaction", "").lower()
+                shares = trade.get("Shares", 0) or 0
+                price = trade.get("Price", 0) or 0
+                value = shares * price
                 
-                mention_count = (reddit_sentiment.mention_count or 0) + (twitter_sentiment.mention_count or 0)
-            elif reddit_sentiment:
-                overall_sentiment = reddit_sentiment.reddit_sentiment
-                mention_count = reddit_sentiment.mention_count or 0
-            elif twitter_sentiment:
-                overall_sentiment = twitter_sentiment.twitter_sentiment
-                mention_count = twitter_sentiment.mention_count or 0
+                if "buy" in transaction_type or "purchase" in transaction_type:
+                    total_buy_value += value
+                elif "sell" in transaction_type or "sale" in transaction_type:
+                    total_sell_value += value
             
-            if overall_sentiment is not None:
-                return SentimentData(
-                    symbol=symbol.upper(),
-                    timestamp=datetime.utcnow(),
-                    overall_sentiment=overall_sentiment,
-                    reddit_sentiment=reddit_sentiment.reddit_sentiment if reddit_sentiment else None,
-                    twitter_sentiment=twitter_sentiment.twitter_sentiment if twitter_sentiment else None,
-                    mention_count=mention_count
-                )
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Failed to get comprehensive sentiment for {symbol}: {e}")
-            return None
-    
-    def _parse_reddit_sentiment(self, symbol: str, data: Dict) -> Optional[SentimentData]:
-        """Parse Reddit sentiment response."""
-        try:
-            if not data or not isinstance(data, list) or len(data) == 0:
+            total_value = total_buy_value + total_sell_value
+            if total_value == 0:
                 return None
             
-            # Use most recent data point
-            recent_data = data[0]
+            # Calculate sentiment: positive for net buying, negative for net selling
+            net_sentiment = (total_buy_value - total_sell_value) / total_value
+            return max(-1.0, min(1.0, net_sentiment))
             
-            sentiment_score = self._normalize_sentiment(recent_data.get('sentiment', 0))
-            mention_count = recent_data.get('mentions', 0)
+        except Exception as e:
+            self.logger.error(f"Failed to get insider trading data for {symbol}: {str(e)}")
+            return None
+    
+    def get_congressional_trading(self, symbol: Optional[str] = None, days: int = 90) -> List[Dict[str, Any]]:
+        """
+        Get congressional trading data.
+        
+        Args:
+            symbol: Optional stock symbol to filter by
+            days: Number of days of data to retrieve
             
-            return SentimentData(
-                symbol=symbol.upper(),
-                timestamp=datetime.utcnow(),
-                reddit_sentiment=sentiment_score,
-                mention_count=mention_count
+        Returns:
+            List of congressional trading records
+        """
+        try:
+            endpoint = f"live/congresstrading/{symbol}" if symbol else "live/congresstrading"
+            response = self.get(endpoint)
+            
+            if not response or not isinstance(response, list):
+                return []
+            
+            # Filter recent trades
+            cutoff_date = datetime.now() - timedelta(days=days)
+            recent_trades = []
+            
+            for trade in response:
+                try:
+                    trade_date = datetime.strptime(trade.get("TransactionDate", ""), "%Y-%m-%d")
+                    if trade_date > cutoff_date.replace(tzinfo=None):
+                        recent_trades.append(trade)
+                except (ValueError, TypeError):
+                    continue
+            
+            return recent_trades
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get congressional trading data: {str(e)}")
+            return []
+    
+    def get_etf_flows(self, etf_symbol: str, days: int = 30) -> Optional[ETFFlowData]:
+        """
+        Get ETF flow data for a symbol.
+        
+        Args:
+            etf_symbol: ETF symbol
+            days: Number of days of data to analyze
+            
+        Returns:
+            ETFFlowData object or None
+        """
+        try:
+            # Note: QuiverQuant may not have direct ETF flow endpoints
+            # This is a placeholder implementation that would need to be
+            # adapted based on actual available endpoints
+            
+            response = self.get(f"live/etfflows/{etf_symbol}")
+            
+            if not response:
+                self.logger.warning(f"No ETF flow data found for {etf_symbol}")
+                return None
+            
+            # This would be adapted based on actual QuiverQuant ETF flow data structure
+            latest_data = response[0] if isinstance(response, list) else response
+            
+            return ETFFlowData(
+                symbol=etf_symbol,
+                date=datetime.strptime(latest_data.get("Date", ""), "%Y-%m-%d").date(),
+                net_flow=Decimal(str(latest_data.get("NetFlow", 0))),
+                inflow=Decimal(str(latest_data.get("Inflow", 0))) if latest_data.get("Inflow") else None,
+                outflow=Decimal(str(latest_data.get("Outflow", 0))) if latest_data.get("Outflow") else None,
+                aum=Decimal(str(latest_data.get("AUM", 0))) if latest_data.get("AUM") else None
             )
             
         except Exception as e:
-            logger.warning(f"Failed to parse Reddit sentiment: {e}")
+            self.logger.error(f"Failed to get ETF flow data for {etf_symbol}: {str(e)}")
             return None
     
-    def _parse_twitter_sentiment(self, symbol: str, data: Dict) -> Optional[SentimentData]:
-        """Parse Twitter sentiment response."""
+    def get_options_flow(self, symbol: str, days: int = 7) -> List[Dict[str, Any]]:
+        """
+        Get unusual options activity data for a symbol.
+        
+        Args:
+            symbol: Stock symbol
+            days: Number of days of data to retrieve
+            
+        Returns:
+            List of options flow records
+        """
         try:
-            if not data or not isinstance(data, list) or len(data) == 0:
+            response = self.get(f"live/optionsflow/{symbol}")
+            
+            if not response or not isinstance(response, list):
+                self.logger.warning(f"No options flow data found for {symbol}")
+                return []
+            
+            # Filter recent activity
+            cutoff_date = datetime.now() - timedelta(days=days)
+            recent_flow = []
+            
+            for flow in response:
+                try:
+                    flow_date = datetime.strptime(flow.get("Date", ""), "%Y-%m-%d")
+                    if flow_date > cutoff_date.replace(tzinfo=None):
+                        recent_flow.append(flow)
+                except (ValueError, TypeError):
+                    continue
+            
+            return recent_flow
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get options flow data for {symbol}: {str(e)}")
+            return []
+    
+    def get_sentiment_summary(self, symbol: str) -> Optional[SentimentData]:
+        """
+        Get comprehensive sentiment summary for a symbol.
+        
+        Args:
+            symbol: Stock symbol
+            
+        Returns:
+            SentimentData object with multiple sentiment sources or None
+        """
+        try:
+            # Gather sentiment from multiple sources
+            reddit_sentiment_data = self.get_reddit_sentiment(symbol)
+            insider_sentiment = self.get_insider_trading(symbol)
+            
+            # Get congressional sentiment
+            congress_trades = self.get_congressional_trading(symbol, days=90)
+            congress_sentiment = self._calculate_congressional_sentiment(congress_trades)
+            
+            if not any([reddit_sentiment_data, insider_sentiment, congress_sentiment]):
                 return None
             
-            # Use most recent data point
-            recent_data = data[0]
+            # Combine sentiments
+            overall_sentiment = 0
+            sentiment_count = 0
             
-            sentiment_score = self._normalize_sentiment(recent_data.get('sentiment', 0))
-            mention_count = recent_data.get('mentions', 0)
+            if reddit_sentiment_data and reddit_sentiment_data.reddit_sentiment is not None:
+                overall_sentiment += reddit_sentiment_data.reddit_sentiment
+                sentiment_count += 1
+            
+            if insider_sentiment is not None:
+                overall_sentiment += insider_sentiment
+                sentiment_count += 1
+            
+            if congress_sentiment is not None:
+                overall_sentiment += congress_sentiment
+                sentiment_count += 1
+            
+            if sentiment_count == 0:
+                return None
+            
+            avg_sentiment = overall_sentiment / sentiment_count
             
             return SentimentData(
-                symbol=symbol.upper(),
+                symbol=symbol,
                 timestamp=datetime.utcnow(),
-                twitter_sentiment=sentiment_score,
-                mention_count=mention_count
+                overall_sentiment=avg_sentiment,
+                reddit_sentiment=reddit_sentiment_data.reddit_sentiment if reddit_sentiment_data else None,
+                insider_sentiment=insider_sentiment,
+                mention_count=reddit_sentiment_data.mention_count if reddit_sentiment_data else None
             )
             
         except Exception as e:
-            logger.warning(f"Failed to parse Twitter sentiment: {e}")
+            self.logger.error(f"Failed to get sentiment summary for {symbol}: {str(e)}")
             return None
     
-    def _parse_insider_trading(self, data: Dict) -> List[Dict[str, Any]]:
-        """Parse insider trading response."""
-        try:
-            if not data or not isinstance(data, list):
-                return []
+    def _calculate_congressional_sentiment(self, trades: List[Dict[str, Any]]) -> Optional[float]:
+        """Calculate sentiment from congressional trading data."""
+        if not trades:
+            return None
+        
+        total_buy_value = 0
+        total_sell_value = 0
+        
+        for trade in trades:
+            transaction_type = trade.get("Transaction", "").lower()
+            amount = trade.get("Amount", 0) or 0
             
-            parsed_trades = []
-            for trade in data:
-                parsed_trade = {
-                    'date': trade.get('date'),
-                    'insider_name': trade.get('insider'),
-                    'title': trade.get('title'),
-                    'transaction_type': trade.get('transaction_type'),
-                    'shares': trade.get('shares'),
-                    'price': trade.get('price'),
-                    'value': trade.get('value'),
-                    'shares_held': trade.get('shares_held')
-                }
-                parsed_trades.append(parsed_trade)
-            
-            return parsed_trades
-            
-        except Exception as e:
-            logger.warning(f"Failed to parse insider trading: {e}")
-            return []
-    
-    def _parse_congress_trading(self, data: Dict) -> List[Dict[str, Any]]:
-        """Parse congressional trading response."""
-        try:
-            if not data or not isinstance(data, list):
-                return []
-            
-            parsed_trades = []
-            for trade in data:
-                parsed_trade = {
-                    'date': trade.get('date'),
-                    'representative': trade.get('representative'),
-                    'transaction_type': trade.get('transaction_type'),
-                    'amount_range': trade.get('amount_range'),
-                    'filed_date': trade.get('filed_date')
-                }
-                parsed_trades.append(parsed_trade)
-            
-            return parsed_trades
-            
-        except Exception as e:
-            logger.warning(f"Failed to parse congress trading: {e}")
-            return []
-    
-    def _parse_institutional_holdings(self, data: Dict) -> List[Dict[str, Any]]:
-        """Parse institutional holdings response."""
-        try:
-            if not data or not isinstance(data, list):
-                return []
-            
-            parsed_holdings = []
-            for holding in data:
-                parsed_holding = {
-                    'date': holding.get('date'),
-                    'institution': holding.get('institution'),
-                    'shares': holding.get('shares'),
-                    'value': holding.get('value'),
-                    'percent_of_portfolio': holding.get('percent_of_portfolio'),
-                    'change_in_shares': holding.get('change_in_shares')
-                }
-                parsed_holdings.append(parsed_holding)
-            
-            return parsed_holdings
-            
-        except Exception as e:
-            logger.warning(f"Failed to parse institutional holdings: {e}")
-            return []
-    
-    def _parse_analyst_ratings(self, data: Dict) -> List[Dict[str, Any]]:
-        """Parse analyst ratings response."""
-        try:
-            if not data or not isinstance(data, list):
-                return []
-            
-            parsed_ratings = []
-            for rating in data:
-                parsed_rating = {
-                    'date': rating.get('date'),
-                    'analyst': rating.get('analyst'),
-                    'rating': rating.get('rating'),
-                    'previous_rating': rating.get('previous_rating'),
-                    'price_target': rating.get('price_target'),
-                    'previous_price_target': rating.get('previous_price_target')
-                }
-                parsed_ratings.append(parsed_rating)
-            
-            return parsed_ratings
-            
-        except Exception as e:
-            logger.warning(f"Failed to parse analyst ratings: {e}")
-            return []
-    
-    def _parse_options_flow(self, data: Dict) -> List[Dict[str, Any]]:
-        """Parse options flow response."""
-        try:
-            if not data or not isinstance(data, list):
-                return []
-            
-            parsed_flows = []
-            for flow in data:
-                parsed_flow = {
-                    'date': flow.get('date'),
-                    'time': flow.get('time'),
-                    'strike': flow.get('strike'),
-                    'expiration': flow.get('expiration'),
-                    'type': flow.get('type'),
-                    'sentiment': flow.get('sentiment'),
-                    'volume': flow.get('volume'),
-                    'premium': flow.get('premium'),
-                    'open_interest': flow.get('open_interest')
-                }
-                parsed_flows.append(parsed_flow)
-            
-            return parsed_flows
-            
-        except Exception as e:
-            logger.warning(f"Failed to parse options flow: {e}")
-            return []
-    
-    def _normalize_sentiment(self, raw_sentiment: Any) -> float:
-        """Normalize sentiment score to -1 to 1 range."""
-        try:
-            if raw_sentiment is None:
-                return 0.0
-            
-            score = float(raw_sentiment)
-            
-            # Assume raw sentiment is already in -1 to 1 range
-            # If not, adjust normalization logic here
-            return max(-1.0, min(1.0, score))
-            
-        except (ValueError, TypeError):
-            return 0.0
-    
-    def test_connection(self) -> bool:
-        """Test QuiverQuant API connection."""
-        try:
-            # Test with a simple endpoint
-            response_data = self.get('/beta/social/reddit', params={'symbol': 'AAPL', 'days': 1})
-            return response_data is not None
-        except Exception as e:
-            logger.error(f"QuiverQuant connection test failed: {e}")
-            return False
-    
-    def get_available_symbols(self) -> List[str]:
-        """Get list of available symbols for sentiment analysis."""
-        try:
-            response_data = self.get('/beta/symbols')
-            if isinstance(response_data, list):
-                return [symbol.upper() for symbol in response_data]
-            return []
-        except Exception as e:
-            logger.error(f"Failed to get available symbols: {e}")
-            return []
+            if "purchase" in transaction_type or "buy" in transaction_type:
+                total_buy_value += amount
+            elif "sale" in transaction_type or "sell" in transaction_type:
+                total_sell_value += amount
+        
+        total_value = total_buy_value + total_sell_value
+        if total_value == 0:
+            return None
+        
+        # Return sentiment: positive for net buying, negative for net selling
+        return (total_buy_value - total_sell_value) / total_value

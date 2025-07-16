@@ -1,387 +1,567 @@
-"""Unit tests for options models."""
+"""
+Unit tests for options data models.
+"""
 
 import pytest
-from datetime import date, datetime
 from decimal import Decimal
+from datetime import date, datetime
+from unittest.mock import Mock, patch
 
-from src.data.models.options import (
-    OptionType, OptionStyle, OptionSymbol, Greeks, OptionQuote,
-    OptionsChain, OptionContract
-)
-
-
-class TestOptionSymbol:
-    """Test OptionSymbol class."""
-    
-    def test_create_option_symbol(self):
-        """Test creating an option symbol."""
-        symbol = OptionSymbol(
-            underlying="AAPL",
-            expiration=date(2024, 1, 19),
-            strike=Decimal("150.00"),
-            option_type=OptionType.CALL
-        )
-        
-        assert symbol.underlying == "AAPL"
-        assert symbol.expiration == date(2024, 1, 19)
-        assert symbol.strike == Decimal("150.00")
-        assert symbol.option_type == OptionType.CALL
-    
-    def test_option_symbol_string_representation(self):
-        """Test option symbol string representation."""
-        symbol = OptionSymbol(
-            underlying="AAPL",
-            expiration=date(2024, 1, 19),
-            strike=Decimal("150.00"),
-            option_type=OptionType.CALL
-        )
-        
-        symbol_str = str(symbol)
-        assert "AAPL" in symbol_str
-        assert "C" in symbol_str
-    
-    def test_option_symbol_from_string(self):
-        """Test parsing option symbol from string."""
-        # This would need proper implementation
-        pass
-    
-    @pytest.mark.parametrize("option_type,expected_char", [
-        (OptionType.CALL, "C"),
-        (OptionType.PUT, "P"),
-    ])
-    def test_option_type_string_representation(self, option_type, expected_char):
-        """Test option type string representation."""
-        symbol = OptionSymbol(
-            underlying="AAPL",
-            expiration=date(2024, 1, 19),
-            strike=Decimal("150.00"),
-            option_type=option_type
-        )
-        
-        assert expected_char in str(symbol)
+from src.data.models.options import OptionContract, OptionChain, OptionData, OptionType
+from src.domain.value_objects.greeks import Greeks
+from src.infrastructure.error_handling import ValidationError
 
 
-class TestGreeks:
-    """Test Greeks class."""
+class TestOptionContract:
+    """Test OptionContract model."""
     
-    def test_create_greeks(self):
-        """Test creating Greeks."""
+    def test_option_contract_creation(self):
+        """Test creating an option contract."""
         greeks = Greeks(
             delta=0.5,
             gamma=0.1,
             theta=-0.05,
             vega=0.2,
-            rho=0.01
+            rho=0.1
         )
         
+        contract = OptionContract(
+            symbol="AAPL210716C00150000",
+            underlying_symbol="AAPL",
+            option_type="call",
+            strike_price=150.0,
+            expiration_date=date(2021, 7, 16),
+            bid=2.50,
+            ask=2.55,
+            last_price=2.52,
+            volume=1000,
+            open_interest=5000,
+            implied_volatility=0.25,
+            greeks=greeks,
+            timestamp=datetime.now()
+        )
+        
+        assert contract.symbol == "AAPL210716C00150000"
+        assert contract.underlying_symbol == "AAPL"
+        assert contract.option_type == "call"
+        assert contract.strike_price == 150.0
+        assert contract.greeks.delta == 0.5
+        assert contract.bid_ask_spread == 0.05
+        assert contract.volume == 1000
+        assert contract.open_interest == 5000
+    
+    def test_option_contract_validation(self):
+        """Test option contract validation."""
+        greeks = Greeks(
+            delta=0.5,
+            gamma=0.1,
+            theta=-0.05,
+            vega=0.2,
+            rho=0.1
+        )
+        
+        # Test invalid strike price
+        with pytest.raises(ValidationError, match="Strike price must be positive"):
+            OptionContract(
+                symbol="AAPL210716C00150000",
+                underlying_symbol="AAPL",
+                option_type="call",
+                strike_price=-150.0,
+                expiration_date=date(2021, 7, 16),
+                bid=2.50,
+                ask=2.55,
+                last_price=2.52,
+                volume=1000,
+                open_interest=5000,
+                implied_volatility=0.25,
+                greeks=greeks,
+                timestamp=datetime.now()
+            )
+        
+        # Test invalid bid/ask spread
+        with pytest.raises(ValidationError, match="Ask must be greater than or equal to bid"):
+            OptionContract(
+                symbol="AAPL210716C00150000",
+                underlying_symbol="AAPL",
+                option_type="call",
+                strike_price=150.0,
+                expiration_date=date(2021, 7, 16),
+                bid=2.55,
+                ask=2.50,
+                last_price=2.52,
+                volume=1000,
+                open_interest=5000,
+                implied_volatility=0.25,
+                greeks=greeks,
+                timestamp=datetime.now()
+            )
+    
+    def test_option_contract_properties(self):
+        """Test computed properties."""
+        greeks = Greeks(
+            delta=0.5,
+            gamma=0.1,
+            theta=-0.05,
+            vega=0.2,
+            rho=0.1
+        )
+        
+        contract = OptionContract(
+            symbol="AAPL210716C00150000",
+            underlying_symbol="AAPL",
+            option_type="call",
+            strike_price=150.0,
+            expiration_date=date(2021, 7, 16),
+            bid=2.50,
+            ask=2.55,
+            last_price=2.52,
+            volume=1000,
+            open_interest=5000,
+            implied_volatility=0.25,
+            greeks=greeks,
+            timestamp=datetime.now()
+        )
+        
+        assert contract.bid_ask_spread == 0.05
+        assert contract.mid_price == 2.525
+        assert contract.volume_open_interest_ratio == 0.2
+        assert contract.is_liquid(min_volume=500, min_open_interest=1000)
+        assert not contract.is_liquid(min_volume=2000, min_open_interest=1000)
+    
+    def test_option_contract_serialization(self):
+        """Test serialization to/from dict."""
+        greeks = Greeks(
+            delta=0.5,
+            gamma=0.1,
+            theta=-0.05,
+            vega=0.2,
+            rho=0.1
+        )
+        
+        contract = OptionContract(
+            symbol="AAPL210716C00150000",
+            underlying_symbol="AAPL",
+            option_type="call",
+            strike_price=150.0,
+            expiration_date=date(2021, 7, 16),
+            bid=2.50,
+            ask=2.55,
+            last_price=2.52,
+            volume=1000,
+            open_interest=5000,
+            implied_volatility=0.25,
+            greeks=greeks,
+            timestamp=datetime.now()
+        )
+        
+        # Test to_dict
+        contract_dict = contract.to_dict()
+        assert contract_dict['symbol'] == "AAPL210716C00150000"
+        assert contract_dict['strike_price'] == 150.0
+        assert contract_dict['greeks']['delta'] == 0.5
+        
+        # Test from_dict
+        reconstructed = OptionContract.from_dict(contract_dict)
+        assert reconstructed.symbol == contract.symbol
+        assert reconstructed.strike_price == contract.strike_price
+        assert reconstructed.greeks.delta == contract.greeks.delta
+
+
+class TestOptionChain:
+    """Test OptionChain model."""
+    
+    def test_option_chain_creation(self):
+        """Test creating an option chain."""
+        # Create sample contracts
+        calls = [
+            OptionContract(
+                symbol="AAPL210716C00150000",
+                underlying_symbol="AAPL",
+                option_type="call",
+                strike_price=150.0,
+                expiration_date=date(2021, 7, 16),
+                bid=2.50,
+                ask=2.55,
+                last_price=2.52,
+                volume=1000,
+                open_interest=5000,
+                implied_volatility=0.25,
+                greeks=Greeks(0.5, 0.1, -0.05, 0.2, 0.1),
+                timestamp=datetime.now()
+            )
+        ]
+        
+        puts = [
+            OptionContract(
+                symbol="AAPL210716P00150000",
+                underlying_symbol="AAPL",
+                option_type="put",
+                strike_price=150.0,
+                expiration_date=date(2021, 7, 16),
+                bid=2.45,
+                ask=2.50,
+                last_price=2.47,
+                volume=800,
+                open_interest=4000,
+                implied_volatility=0.28,
+                greeks=Greeks(-0.5, 0.1, -0.05, 0.2, -0.1),
+                timestamp=datetime.now()
+            )
+        ]
+        
+        chain = OptionChain(
+            symbol="AAPL",
+            expiration_date=date(2021, 7, 16),
+            calls=calls,
+            puts=puts,
+            timestamp=datetime.now()
+        )
+        
+        assert chain.symbol == "AAPL"
+        assert len(chain.calls) == 1
+        assert len(chain.puts) == 1
+        assert chain.total_contracts == 2
+    
+    def test_option_chain_filtering(self):
+        """Test filtering options in chain."""
+        # Create sample contracts with different strikes
+        calls = [
+            OptionContract(
+                symbol="AAPL210716C00145000",
+                underlying_symbol="AAPL",
+                option_type="call",
+                strike_price=145.0,
+                expiration_date=date(2021, 7, 16),
+                bid=5.50,
+                ask=5.55,
+                last_price=5.52,
+                volume=2000,
+                open_interest=8000,
+                implied_volatility=0.23,
+                greeks=Greeks(0.7, 0.08, -0.06, 0.18, 0.12),
+                timestamp=datetime.now()
+            ),
+            OptionContract(
+                symbol="AAPL210716C00150000",
+                underlying_symbol="AAPL",
+                option_type="call",
+                strike_price=150.0,
+                expiration_date=date(2021, 7, 16),
+                bid=2.50,
+                ask=2.55,
+                last_price=2.52,
+                volume=1000,
+                open_interest=5000,
+                implied_volatility=0.25,
+                greeks=Greeks(0.5, 0.1, -0.05, 0.2, 0.1),
+                timestamp=datetime.now()
+            ),
+            OptionContract(
+                symbol="AAPL210716C00155000",
+                underlying_symbol="AAPL",
+                option_type="call",
+                strike_price=155.0,
+                expiration_date=date(2021, 7, 16),
+                bid=0.75,
+                ask=0.80,
+                last_price=0.77,
+                volume=500,
+                open_interest=2000,
+                implied_volatility=0.27,
+                greeks=Greeks(0.3, 0.12, -0.04, 0.22, 0.08),
+                timestamp=datetime.now()
+            )
+        ]
+        
+        chain = OptionChain(
+            symbol="AAPL",
+            expiration_date=date(2021, 7, 16),
+            calls=calls,
+            puts=[],
+            timestamp=datetime.now()
+        )
+        
+        # Test filtering by strike range
+        filtered = chain.filter_by_strike_range(min_strike=146.0, max_strike=154.0)
+        assert len(filtered.calls) == 1
+        assert filtered.calls[0].strike_price == 150.0
+        
+        # Test filtering by delta range
+        filtered = chain.filter_by_delta_range(min_delta=0.4, max_delta=0.6)
+        assert len(filtered.calls) == 1
+        assert filtered.calls[0].greeks.delta == 0.5
+        
+        # Test filtering by volume
+        filtered = chain.filter_by_volume(min_volume=1500)
+        assert len(filtered.calls) == 1
+        assert filtered.calls[0].volume == 2000
+    
+    def test_option_chain_analytics(self):
+        """Test chain analytics calculations."""
+        calls = [
+            OptionContract(
+                symbol="AAPL210716C00150000",
+                underlying_symbol="AAPL",
+                option_type="call",
+                strike_price=150.0,
+                expiration_date=date(2021, 7, 16),
+                bid=2.50,
+                ask=2.55,
+                last_price=2.52,
+                volume=1000,
+                open_interest=5000,
+                implied_volatility=0.25,
+                greeks=Greeks(0.5, 0.1, -0.05, 0.2, 0.1),
+                timestamp=datetime.now()
+            )
+        ]
+        
+        puts = [
+            OptionContract(
+                symbol="AAPL210716P00150000",
+                underlying_symbol="AAPL",
+                option_type="put",
+                strike_price=150.0,
+                expiration_date=date(2021, 7, 16),
+                bid=2.45,
+                ask=2.50,
+                last_price=2.47,
+                volume=800,
+                open_interest=4000,
+                implied_volatility=0.28,
+                greeks=Greeks(-0.5, 0.1, -0.05, 0.2, -0.1),
+                timestamp=datetime.now()
+            )
+        ]
+        
+        chain = OptionChain(
+            symbol="AAPL",
+            expiration_date=date(2021, 7, 16),
+            calls=calls,
+            puts=puts,
+            timestamp=datetime.now()
+        )
+        
+        # Test put-call ratio
+        assert chain.put_call_ratio == 0.8  # 800 / 1000
+        
+        # Test total volume
+        assert chain.total_volume == 1800
+        
+        # Test total open interest
+        assert chain.total_open_interest == 9000
+        
+        # Test average IV
+        assert chain.average_iv == 0.265  # (0.25 + 0.28) / 2
+    
+    def test_option_chain_serialization(self):
+        """Test chain serialization."""
+        calls = [
+            OptionContract(
+                symbol="AAPL210716C00150000",
+                underlying_symbol="AAPL",
+                option_type="call",
+                strike_price=150.0,
+                expiration_date=date(2021, 7, 16),
+                bid=2.50,
+                ask=2.55,
+                last_price=2.52,
+                volume=1000,
+                open_interest=5000,
+                implied_volatility=0.25,
+                greeks=Greeks(0.5, 0.1, -0.05, 0.2, 0.1),
+                timestamp=datetime.now()
+            )
+        ]
+        
+        chain = OptionChain(
+            symbol="AAPL",
+            expiration_date=date(2021, 7, 16),
+            calls=calls,
+            puts=[],
+            timestamp=datetime.now()
+        )
+        
+        # Test to_dict
+        chain_dict = chain.to_dict()
+        assert chain_dict['symbol'] == "AAPL"
+        assert len(chain_dict['calls']) == 1
+        assert len(chain_dict['puts']) == 0
+        
+        # Test from_dict
+        reconstructed = OptionChain.from_dict(chain_dict)
+        assert reconstructed.symbol == chain.symbol
+        assert len(reconstructed.calls) == len(chain.calls)
+        assert reconstructed.calls[0].symbol == chain.calls[0].symbol
+
+
+class TestOptionData:
+    """Test OptionData model."""
+    
+    def test_option_data_creation(self):
+        """Test creating option data."""
+        data = OptionData(
+            symbol="AAPL210716C00150000",
+            underlying_symbol="AAPL",
+            option_type=OptionType.CALL,
+            strike_price=150.0,
+            expiration_date=date(2021, 7, 16),
+            bid=2.50,
+            ask=2.55,
+            last_price=2.52,
+            volume=1000,
+            open_interest=5000,
+            implied_volatility=0.25,
+            delta=0.5,
+            gamma=0.1,
+            theta=-0.05,
+            vega=0.2,
+            rho=0.1,
+            timestamp=datetime.now()
+        )
+        
+        assert data.symbol == "AAPL210716C00150000"
+        assert data.option_type == OptionType.CALL
+        assert data.strike_price == 150.0
+        assert data.delta == 0.5
+    
+    def test_option_data_validation(self):
+        """Test option data validation."""
+        # Test invalid option type
+        with pytest.raises(ValidationError):
+            OptionData(
+                symbol="AAPL210716C00150000",
+                underlying_symbol="AAPL",
+                option_type="invalid",
+                strike_price=150.0,
+                expiration_date=date(2021, 7, 16),
+                bid=2.50,
+                ask=2.55,
+                last_price=2.52,
+                volume=1000,
+                open_interest=5000,
+                implied_volatility=0.25,
+                delta=0.5,
+                gamma=0.1,
+                theta=-0.05,
+                vega=0.2,
+                rho=0.1,
+                timestamp=datetime.now()
+            )
+        
+        # Test invalid volume
+        with pytest.raises(ValidationError):
+            OptionData(
+                symbol="AAPL210716C00150000",
+                underlying_symbol="AAPL",
+                option_type=OptionType.CALL,
+                strike_price=150.0,
+                expiration_date=date(2021, 7, 16),
+                bid=2.50,
+                ask=2.55,
+                last_price=2.52,
+                volume=-1000,
+                open_interest=5000,
+                implied_volatility=0.25,
+                delta=0.5,
+                gamma=0.1,
+                theta=-0.05,
+                vega=0.2,
+                rho=0.1,
+                timestamp=datetime.now()
+            )
+    
+    def test_option_data_properties(self):
+        """Test computed properties."""
+        data = OptionData(
+            symbol="AAPL210716C00150000",
+            underlying_symbol="AAPL",
+            option_type=OptionType.CALL,
+            strike_price=150.0,
+            expiration_date=date(2021, 7, 16),
+            bid=2.50,
+            ask=2.55,
+            last_price=2.52,
+            volume=1000,
+            open_interest=5000,
+            implied_volatility=0.25,
+            delta=0.5,
+            gamma=0.1,
+            theta=-0.05,
+            vega=0.2,
+            rho=0.1,
+            timestamp=datetime.now()
+        )
+        
+        assert data.bid_ask_spread == 0.05
+        assert data.mid_price == 2.525
+        assert data.is_in_the_money(underlying_price=155.0)
+        assert not data.is_in_the_money(underlying_price=145.0)
+        assert data.moneyness(underlying_price=150.0) == 1.0
+        assert data.time_to_expiration.days > 0
+    
+    def test_option_data_greeks_object(self):
+        """Test Greeks object creation."""
+        data = OptionData(
+            symbol="AAPL210716C00150000",
+            underlying_symbol="AAPL",
+            option_type=OptionType.CALL,
+            strike_price=150.0,
+            expiration_date=date(2021, 7, 16),
+            bid=2.50,
+            ask=2.55,
+            last_price=2.52,
+            volume=1000,
+            open_interest=5000,
+            implied_volatility=0.25,
+            delta=0.5,
+            gamma=0.1,
+            theta=-0.05,
+            vega=0.2,
+            rho=0.1,
+            timestamp=datetime.now()
+        )
+        
+        greeks = data.get_greeks()
+        assert isinstance(greeks, Greeks)
         assert greeks.delta == 0.5
         assert greeks.gamma == 0.1
         assert greeks.theta == -0.05
         assert greeks.vega == 0.2
-        assert greeks.rho == 0.01
+        assert greeks.rho == 0.1
     
-    def test_greeks_validation(self):
-        """Test Greeks validation."""
-        # Delta should be between -1 and 1
-        with pytest.raises(ValueError):
-            Greeks(delta=2.0)
-        
-        with pytest.raises(ValueError):
-            Greeks(delta=-2.0)
-        
-        # Gamma should be non-negative
-        with pytest.raises(ValueError):
-            Greeks(gamma=-0.1)
-    
-    def test_greeks_optional_fields(self):
-        """Test Greeks with optional fields."""
-        greeks = Greeks(delta=0.5)
-        
-        assert greeks.delta == 0.5
-        assert greeks.gamma is None
-        assert greeks.theta is None
-        assert greeks.vega is None
-        assert greeks.rho is None
-
-
-class TestOptionQuote:
-    """Test OptionQuote class."""
-    
-    def test_create_option_quote(self):
-        """Test creating an option quote."""
-        quote = OptionQuote(
-            symbol="AAPL240119C00150000",
-            underlying="AAPL",
-            strike=Decimal("150.00"),
-            expiration=date(2024, 1, 19),
+    def test_option_data_serialization(self):
+        """Test serialization to/from dict."""
+        data = OptionData(
+            symbol="AAPL210716C00150000",
+            underlying_symbol="AAPL",
             option_type=OptionType.CALL,
-            bid=Decimal("5.00"),
-            ask=Decimal("5.20"),
-            last=Decimal("5.10"),
-            volume=100,
-            open_interest=1000,
-            implied_volatility=0.25
+            strike_price=150.0,
+            expiration_date=date(2021, 7, 16),
+            bid=2.50,
+            ask=2.55,
+            last_price=2.52,
+            volume=1000,
+            open_interest=5000,
+            implied_volatility=0.25,
+            delta=0.5,
+            gamma=0.1,
+            theta=-0.05,
+            vega=0.2,
+            rho=0.1,
+            timestamp=datetime.now()
         )
         
-        assert quote.symbol == "AAPL240119C00150000"
-        assert quote.underlying == "AAPL"
-        assert quote.strike == Decimal("150.00")
-        assert quote.option_type == OptionType.CALL
-        assert quote.bid == Decimal("5.00")
-        assert quote.ask == Decimal("5.20")
-    
-    def test_mid_price_calculation(self):
-        """Test mid price calculation."""
-        quote = OptionQuote(
-            symbol="AAPL240119C00150000",
-            underlying="AAPL",
-            strike=Decimal("150.00"),
-            expiration=date(2024, 1, 19),
-            option_type=OptionType.CALL,
-            bid=Decimal("5.00"),
-            ask=Decimal("5.20")
-        )
+        # Test to_dict
+        data_dict = data.to_dict()
+        assert data_dict['symbol'] == "AAPL210716C00150000"
+        assert data_dict['option_type'] == "call"
+        assert data_dict['strike_price'] == 150.0
+        assert data_dict['delta'] == 0.5
         
-        assert quote.mid_price == Decimal("5.10")
-    
-    def test_bid_ask_spread(self):
-        """Test bid-ask spread calculation."""
-        quote = OptionQuote(
-            symbol="AAPL240119C00150000",
-            underlying="AAPL",
-            strike=Decimal("150.00"),
-            expiration=date(2024, 1, 19),
-            option_type=OptionType.CALL,
-            bid=Decimal("5.00"),
-            ask=Decimal("5.20")
-        )
-        
-        assert quote.bid_ask_spread == Decimal("0.20")
-        assert abs(quote.bid_ask_spread_pct - 0.039216) < 0.0001
-    
-    def test_days_to_expiration(self):
-        """Test days to expiration calculation."""
-        # This would need to be mocked for consistent testing
-        pass
-    
-    def test_liquidity_check(self):
-        """Test liquidity check."""
-        quote = OptionQuote(
-            symbol="AAPL240119C00150000",
-            underlying="AAPL",
-            strike=Decimal("150.00"),
-            expiration=date(2024, 1, 19),
-            option_type=OptionType.CALL,
-            bid=Decimal("5.00"),
-            ask=Decimal("5.20"),
-            volume=100,
-            open_interest=1000
-        )
-        
-        assert quote.is_liquid(min_volume=10, min_oi=100, max_spread_pct=0.5)
-        assert not quote.is_liquid(min_volume=200, min_oi=100, max_spread_pct=0.5)
-    
-    def test_quote_freshness(self):
-        """Test quote freshness check."""
-        quote = OptionQuote(
-            symbol="AAPL240119C00150000",
-            underlying="AAPL",
-            strike=Decimal("150.00"),
-            expiration=date(2024, 1, 19),
-            option_type=OptionType.CALL,
-            quote_time=datetime.utcnow()
-        )
-        
-        assert quote.is_quote_fresh(max_age_minutes=10)
-
-
-class TestOptionsChain:
-    """Test OptionsChain class."""
-    
-    def test_create_options_chain(self):
-        """Test creating an options chain."""
-        chain = OptionsChain(
-            underlying="AAPL",
-            underlying_price=Decimal("150.00")
-        )
-        
-        assert chain.underlying == "AAPL"
-        assert chain.underlying_price == Decimal("150.00")
-        assert len(chain.options) == 0
-    
-    def test_add_option_to_chain(self):
-        """Test adding option to chain."""
-        chain = OptionsChain(underlying="AAPL")
-        
-        quote = OptionQuote(
-            symbol="AAPL240119C00150000",
-            underlying="AAPL",
-            strike=Decimal("150.00"),
-            expiration=date(2024, 1, 19),
-            option_type=OptionType.CALL,
-            bid=Decimal("5.00"),
-            ask=Decimal("5.20")
-        )
-        
-        chain.add_option(quote)
-        
-        retrieved_quote = chain.get_option(
-            date(2024, 1, 19), 
-            Decimal("150.00"), 
-            OptionType.CALL
-        )
-        
-        assert retrieved_quote == quote
-    
-    def test_get_expirations(self):
-        """Test getting expirations."""
-        chain = OptionsChain(underlying="AAPL")
-        
-        # Add options with different expirations
-        exp1 = date(2024, 1, 19)
-        exp2 = date(2024, 2, 16)
-        
-        quote1 = OptionQuote(
-            symbol="AAPL240119C00150000",
-            underlying="AAPL",
-            strike=Decimal("150.00"),
-            expiration=exp1,
-            option_type=OptionType.CALL
-        )
-        
-        quote2 = OptionQuote(
-            symbol="AAPL240216C00150000",
-            underlying="AAPL",
-            strike=Decimal("150.00"),
-            expiration=exp2,
-            option_type=OptionType.CALL
-        )
-        
-        chain.add_option(quote1)
-        chain.add_option(quote2)
-        
-        expirations = chain.get_expirations()
-        assert exp1 in expirations
-        assert exp2 in expirations
-        assert expirations == sorted(expirations)
-    
-    def test_get_atm_strike(self):
-        """Test getting ATM strike."""
-        chain = OptionsChain(
-            underlying="AAPL",
-            underlying_price=Decimal("152.50")
-        )
-        
-        exp = date(2024, 1, 19)
-        
-        # Add options with different strikes
-        for strike in [Decimal("150.00"), Decimal("155.00"), Decimal("160.00")]:
-            quote = OptionQuote(
-                symbol=f"AAPL240119C00{int(strike*100):05d}000",
-                underlying="AAPL",
-                strike=strike,
-                expiration=exp,
-                option_type=OptionType.CALL
-            )
-            chain.add_option(quote)
-        
-        atm_strike = chain.get_atm_strike(exp)
-        assert atm_strike == Decimal("155.00")  # Closest to 152.50
-    
-    def test_filter_liquid_options(self):
-        """Test filtering liquid options."""
-        chain = OptionsChain(underlying="AAPL")
-        
-        # Add liquid option
-        liquid_quote = OptionQuote(
-            symbol="AAPL240119C00150000",
-            underlying="AAPL",
-            strike=Decimal("150.00"),
-            expiration=date(2024, 1, 19),
-            option_type=OptionType.CALL,
-            bid=Decimal("5.00"),
-            ask=Decimal("5.20"),
-            volume=100,
-            open_interest=1000
-        )
-        
-        # Add illiquid option
-        illiquid_quote = OptionQuote(
-            symbol="AAPL240119C00160000",
-            underlying="AAPL",
-            strike=Decimal("160.00"),
-            expiration=date(2024, 1, 19),
-            option_type=OptionType.CALL,
-            bid=Decimal("1.00"),
-            ask=Decimal("3.00"),  # Wide spread
-            volume=5,  # Low volume
-            open_interest=50  # Low OI
-        )
-        
-        chain.add_option(liquid_quote)
-        chain.add_option(illiquid_quote)
-        
-        filtered_chain = chain.filter_liquid_options(
-            min_volume=10,
-            min_oi=100,
-            max_spread_pct=0.5
-        )
-        
-        # Should only contain liquid option
-        assert len(filtered_chain.options) == 1
-        assert filtered_chain.get_option(
-            date(2024, 1, 19), 
-            Decimal("150.00"), 
-            OptionType.CALL
-        ) is not None
-        assert filtered_chain.get_option(
-            date(2024, 1, 19), 
-            Decimal("160.00"), 
-            OptionType.CALL
-        ) is None
-
-
-class TestOptionContract:
-    """Test OptionContract class."""
-    
-    def test_create_option_contract(self):
-        """Test creating an option contract."""
-        symbol = OptionSymbol(
-            underlying="AAPL",
-            expiration=date(2024, 1, 19),
-            strike=Decimal("150.00"),
-            option_type=OptionType.CALL
-        )
-        
-        contract = OptionContract(
-            symbol=symbol,
-            contract_size=100,
-            exercise_style=OptionStyle.AMERICAN
-        )
-        
-        assert contract.symbol == symbol
-        assert contract.contract_size == 100
-        assert contract.exercise_style == OptionStyle.AMERICAN
-    
-    def test_option_contract_with_quote(self):
-        """Test option contract with quote."""
-        symbol = OptionSymbol(
-            underlying="AAPL",
-            expiration=date(2024, 1, 19),
-            strike=Decimal("150.00"),
-            option_type=OptionType.CALL
-        )
-        
-        quote = OptionQuote(
-            symbol="AAPL240119C00150000",
-            underlying="AAPL",
-            strike=Decimal("150.00"),
-            expiration=date(2024, 1, 19),
-            option_type=OptionType.CALL,
-            bid=Decimal("5.00"),
-            ask=Decimal("5.20")
-        )
-        
-        contract = OptionContract(symbol=symbol, quote=quote)
-        
-        assert contract.quote == quote
+        # Test from_dict
+        reconstructed = OptionData.from_dict(data_dict)
+        assert reconstructed.symbol == data.symbol
+        assert reconstructed.option_type == data.option_type
+        assert reconstructed.strike_price == data.strike_price
+        assert reconstructed.delta == data.delta

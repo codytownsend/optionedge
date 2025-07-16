@@ -1,343 +1,341 @@
 """
-Base API client with retry logic, rate limiting, and error handling.
+Abstract base class for all API clients with standardized functionality.
 """
 
-import asyncio
 import time
-from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Union, List
-from datetime import datetime, timedelta
 import logging
+from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, Union, List
+from dataclasses import dataclass
+from enum import Enum
 
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-logger = logging.getLogger(__name__)
+class CircuitBreakerState(Enum):
+    """Circuit breaker states."""
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
 
 
-class APIError(Exception):
-    """Base API error."""
-    def __init__(self, message: str, status_code: Optional[int] = None, response_data: Optional[Dict] = None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.response_data = response_data
+@dataclass
+class RateLimitConfig:
+    """Rate limiting configuration."""
+    requests_per_minute: int
+    requests_per_hour: Optional[int] = None
+    burst_allowance: int = 5
 
 
-class RateLimitError(APIError):
-    """Rate limit exceeded error."""
-    def __init__(self, message: str, retry_after: Optional[int] = None):
-        super().__init__(message)
-        self.retry_after = retry_after
+@dataclass
+class CircuitBreakerConfig:
+    """Circuit breaker configuration."""
+    failure_threshold: int = 5
+    timeout_seconds: int = 60
+    half_open_max_calls: int = 3
 
 
-class DataQualityError(APIError):
-    """Data quality issue error."""
-    pass
+class CircuitBreaker:
+    """Circuit breaker implementation for API resilience."""
+    
+    def __init__(self, config: CircuitBreakerConfig):
+        self.config = config
+        self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.last_failure_time: Optional[datetime] = None
+        self.half_open_call_count = 0
+        
+    def can_execute(self) -> bool:
+        """Check if request can be executed based on circuit breaker state."""
+        if self.state == CircuitBreakerState.CLOSED:
+            return True
+        elif self.state == CircuitBreakerState.OPEN:
+            if (self.last_failure_time and 
+                datetime.utcnow() - self.last_failure_time >= timedelta(seconds=self.config.timeout_seconds)):
+                self.state = CircuitBreakerState.HALF_OPEN
+                self.half_open_call_count = 0
+                return True
+            return False
+        elif self.state == CircuitBreakerState.HALF_OPEN:
+            return self.half_open_call_count < self.config.half_open_max_calls
+        
+        return False
+    
+    def record_success(self):
+        """Record successful request."""
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.half_open_call_count = 0
+    
+    def record_failure(self):
+        """Record failed request."""
+        self.failure_count += 1
+        self.last_failure_time = datetime.utcnow()
+        
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self.state = CircuitBreakerState.OPEN
+        elif self.failure_count >= self.config.failure_threshold:
+            self.state = CircuitBreakerState.OPEN
+        
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self.half_open_call_count += 1
 
 
 class RateLimiter:
-    """Simple rate limiter implementation."""
+    """Token bucket rate limiter implementation."""
     
-    def __init__(self, max_requests: int, window_seconds: int):
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
-        self.requests = []
-        self._lock = asyncio.Lock() if asyncio.iscoroutinefunction(self.__init__) else None
+    def __init__(self, config: RateLimitConfig):
+        self.config = config
+        self.tokens = config.burst_allowance
+        self.last_refill = time.time()
+        self.request_times: List[float] = []
     
     def can_proceed(self) -> bool:
-        """Check if request can proceed without hitting rate limit."""
+        """Check if request can proceed based on rate limits."""
         now = time.time()
-        # Remove old requests outside the window
-        self.requests = [req_time for req_time in self.requests 
-                        if now - req_time < self.window_seconds]
         
-        return len(self.requests) < self.max_requests
-    
-    def add_request(self):
-        """Record a new request."""
-        now = time.time()
-        self.requests.append(now)
-    
-    def get_wait_time(self) -> float:
-        """Get time to wait before next request can be made."""
-        if self.can_proceed():
-            return 0.0
+        # Refill tokens based on time elapsed
+        time_elapsed = now - self.last_refill
+        tokens_to_add = (time_elapsed / 60.0) * self.config.requests_per_minute
+        self.tokens = min(self.config.burst_allowance, self.tokens + tokens_to_add)
+        self.last_refill = now
         
-        # Find the oldest request that needs to expire
-        now = time.time()
-        oldest_in_window = min(self.requests)
-        return max(0, self.window_seconds - (now - oldest_in_window))
+        # Check if we have tokens available
+        if self.tokens < 1:
+            return False
+        
+        # Check hourly limit if configured
+        if self.config.requests_per_hour:
+            hour_ago = now - 3600
+            recent_requests = [t for t in self.request_times if t > hour_ago]
+            if len(recent_requests) >= self.config.requests_per_hour:
+                return False
+        
+        return True
+    
+    def consume_token(self):
+        """Consume a rate limit token."""
+        self.tokens -= 1
+        self.request_times.append(time.time())
+        
+        # Clean old request times (keep only last hour)
+        hour_ago = time.time() - 3600
+        self.request_times = [t for t in self.request_times if t > hour_ago]
+
+
+class APIClientError(Exception):
+    """Base exception for API client errors."""
+    pass
+
+
+class RateLimitError(APIClientError):
+    """Raised when rate limit is exceeded."""
+    pass
+
+
+class CircuitBreakerError(APIClientError):
+    """Raised when circuit breaker is open."""
+    pass
 
 
 class BaseAPIClient(ABC):
-    """Base class for all API clients with common functionality."""
+    """
+    Abstract base class for all API clients with standardized functionality.
     
-    def __init__(self, 
-                 base_url: str,
-                 api_key: str,
-                 rate_limit_per_minute: int = 60,
-                 timeout: int = 30,
-                 max_retries: int = 3):
-        """
-        Initialize base API client.
-        
-        Args:
-            base_url: API base URL
-            api_key: API authentication key
-            rate_limit_per_minute: Maximum requests per minute
-            timeout: Request timeout in seconds
-            max_retries: Maximum retry attempts
-        """
+    Provides:
+    - Standardized request/response handling
+    - Automatic retry logic with exponential backoff
+    - Rate limiting respecting provider constraints
+    - Circuit breaker pattern for failing services
+    - Request/response logging for debugging
+    """
+    
+    def __init__(
+        self,
+        base_url: str,
+        api_key: Optional[str] = None,
+        rate_limit_config: Optional[RateLimitConfig] = None,
+        circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
+        timeout: int = 30,
+        max_retries: int = 3
+    ):
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key
         self.timeout = timeout
         self.max_retries = max_retries
         
-        # Rate limiting
-        self.rate_limiter = RateLimiter(rate_limit_per_minute, 60)
+        # Set up logging
+        self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
+        
+        # Initialize rate limiter
+        self.rate_limiter = RateLimiter(
+            rate_limit_config or RateLimitConfig(requests_per_minute=60)
+        )
+        
+        # Initialize circuit breaker
+        self.circuit_breaker = CircuitBreaker(
+            circuit_breaker_config or CircuitBreakerConfig()
+        )
         
         # Configure session with retry strategy
         self.session = requests.Session()
         retry_strategy = Retry(
             total=max_retries,
-            backoff_factor=1,
+            backoff_factor=1,  # 1s, 2s, 4s delays
             status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE"]
+            allowed_methods=["GET", "POST"]
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
-        
-        # Set default headers
-        self.session.headers.update(self._get_default_headers())
-        
-        # Circuit breaker state
-        self.consecutive_failures = 0
-        self.last_failure_time = None
-        self.circuit_breaker_threshold = 5
-        self.circuit_breaker_timeout = 300  # 5 minutes
     
     @abstractmethod
-    def _get_default_headers(self) -> Dict[str, str]:
-        """Get default headers for API requests."""
+    def authenticate(self) -> Dict[str, str]:
+        """Return authentication headers for requests."""
         pass
     
     @abstractmethod
-    def _validate_response(self, response: requests.Response) -> bool:
-        """Validate API response format and data quality."""
+    def get_provider_name(self) -> str:
+        """Return the name of the data provider."""
         pass
     
-    def _is_circuit_breaker_open(self) -> bool:
-        """Check if circuit breaker is open."""
-        if self.consecutive_failures < self.circuit_breaker_threshold:
-            return False
+    def _build_url(self, endpoint: str) -> str:
+        """Build full URL from endpoint."""
+        endpoint = endpoint.lstrip('/')
+        return f"{self.base_url}/{endpoint}"
+    
+    def _check_rate_limit(self):
+        """Check and enforce rate limits."""
+        if not self.rate_limiter.can_proceed():
+            self.logger.warning(f"Rate limit exceeded for {self.get_provider_name()}")
+            raise RateLimitError(f"Rate limit exceeded for {self.get_provider_name()}")
+    
+    def _check_circuit_breaker(self):
+        """Check circuit breaker state."""
+        if not self.circuit_breaker.can_execute():
+            self.logger.warning(f"Circuit breaker open for {self.get_provider_name()}")
+            raise CircuitBreakerError(f"Circuit breaker open for {self.get_provider_name()}")
+    
+    def _make_request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None
+    ) -> requests.Response:
+        """Make HTTP request with all safety mechanisms."""
         
-        if self.last_failure_time is None:
-            return False
-        
-        time_since_failure = time.time() - self.last_failure_time
-        return time_since_failure < self.circuit_breaker_timeout
-    
-    def _record_success(self):
-        """Record successful API call."""
-        self.consecutive_failures = 0
-        self.last_failure_time = None
-    
-    def _record_failure(self):
-        """Record failed API call."""
-        self.consecutive_failures += 1
-        self.last_failure_time = time.time()
-    
-    def _wait_for_rate_limit(self):
-        """Wait if rate limit would be exceeded."""
-        wait_time = self.rate_limiter.get_wait_time()
-        if wait_time > 0:
-            logger.info(f"Rate limit reached, waiting {wait_time:.2f} seconds")
-            time.sleep(wait_time)
-    
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((requests.RequestException, RateLimitError))
-    )
-    def _make_request(self, 
-                     method: str, 
-                     endpoint: str, 
-                     params: Optional[Dict] = None,
-                     data: Optional[Dict] = None,
-                     headers: Optional[Dict] = None) -> requests.Response:
-        """
-        Make HTTP request with retry logic and error handling.
-        
-        Args:
-            method: HTTP method (GET, POST, etc.)
-            endpoint: API endpoint path
-            params: Query parameters
-            data: Request body data
-            headers: Additional headers
-            
-        Returns:
-            Response object
-            
-        Raises:
-            APIError: For API-specific errors
-            RateLimitError: When rate limited
-        """
         # Check circuit breaker
-        if self._is_circuit_breaker_open():
-            raise APIError(f"Circuit breaker open for {self.__class__.__name__}")
+        self._check_circuit_breaker()
         
-        # Check rate limit
-        self._wait_for_rate_limit()
+        # Check rate limits
+        self._check_rate_limit()
         
-        # Prepare request
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        request_headers = self.session.headers.copy()
+        # Build request
+        url = self._build_url(endpoint)
+        request_headers = self.authenticate()
         if headers:
             request_headers.update(headers)
         
+        # Log request
+        self.logger.debug(
+            f"Making {method} request to {url} with params: {params}, headers: {list(request_headers.keys())}"
+        )
+        
         try:
+            # Consume rate limit token
+            self.rate_limiter.consume_token()
+            
             # Make request
-            self.rate_limiter.add_request()
             response = self.session.request(
-                method=method.upper(),
+                method=method,
                 url=url,
                 params=params,
-                json=data if method.upper() in ['POST', 'PUT', 'PATCH'] else None,
+                json=data,
                 headers=request_headers,
                 timeout=self.timeout
             )
             
-            # Handle rate limiting
-            if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 60))
-                self._record_failure()
-                raise RateLimitError(f"Rate limit exceeded", retry_after)
+            # Log response
+            self.logger.debug(
+                f"Response from {url}: status={response.status_code}, "
+                f"content_length={len(response.content) if response.content else 0}"
+            )
             
-            # Handle other HTTP errors
-            if not response.ok:
-                self._record_failure()
-                error_msg = f"HTTP {response.status_code}: {response.text}"
-                raise APIError(error_msg, response.status_code)
+            # Check for HTTP errors
+            response.raise_for_status()
             
-            # Validate response
-            if not self._validate_response(response):
-                self._record_failure()
-                raise DataQualityError("Response failed validation")
+            # Record success
+            self.circuit_breaker.record_success()
             
-            self._record_success()
             return response
             
-        except requests.RequestException as e:
-            self._record_failure()
-            logger.error(f"Request failed: {e}")
-            raise APIError(f"Request failed: {e}")
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Request failed for {url}: {str(e)}")
+            self.circuit_breaker.record_failure()
+            raise APIClientError(f"Request failed: {str(e)}") from e
     
-    def get(self, endpoint: str, params: Optional[Dict] = None, **kwargs) -> Dict[str, Any]:
+    def get(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
         """Make GET request and return JSON response."""
-        response = self._make_request('GET', endpoint, params=params, **kwargs)
-        return response.json()
+        response = self._make_request("GET", endpoint, params=params, headers=headers)
+        
+        try:
+            return response.json()
+        except ValueError as e:
+            self.logger.error(f"Failed to parse JSON response from {endpoint}")
+            raise APIClientError(f"Invalid JSON response: {str(e)}") from e
     
-    def post(self, endpoint: str, data: Optional[Dict] = None, **kwargs) -> Dict[str, Any]:
+    def post(
+        self,
+        endpoint: str,
+        data: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
         """Make POST request and return JSON response."""
-        response = self._make_request('POST', endpoint, data=data, **kwargs)
-        return response.json()
+        response = self._make_request("POST", endpoint, params=params, data=data, headers=headers)
+        
+        try:
+            return response.json()
+        except ValueError as e:
+            self.logger.error(f"Failed to parse JSON response from {endpoint}")
+            raise APIClientError(f"Invalid JSON response: {str(e)}") from e
     
-    def get_health_status(self) -> Dict[str, Any]:
-        """Get API client health status."""
+    def health_check(self) -> bool:
+        """Perform health check on the API."""
+        try:
+            # This should be overridden by subclasses with provider-specific health checks
+            response = self._make_request("GET", "/")
+            return response.status_code == 200
+        except Exception as e:
+            self.logger.warning(f"Health check failed for {self.get_provider_name()}: {str(e)}")
+            return False
+    
+    def get_circuit_breaker_state(self) -> CircuitBreakerState:
+        """Get current circuit breaker state."""
+        return self.circuit_breaker.state
+    
+    def get_rate_limit_status(self) -> Dict[str, Any]:
+        """Get current rate limit status."""
         return {
-            'client_name': self.__class__.__name__,
-            'base_url': self.base_url,
-            'consecutive_failures': self.consecutive_failures,
-            'circuit_breaker_open': self._is_circuit_breaker_open(),
-            'last_failure_time': self.last_failure_time,
-            'rate_limit_requests': len(self.rate_limiter.requests),
-            'rate_limit_capacity': self.rate_limiter.max_requests
+            "tokens_available": self.rate_limiter.tokens,
+            "requests_per_minute": self.rate_limiter.config.requests_per_minute,
+            "recent_request_count": len(self.rate_limiter.request_times)
         }
-
-
-class DataValidator:
-    """Utility class for validating API response data."""
     
-    @staticmethod
-    def validate_quote_data(data: Dict) -> bool:
-        """Validate options or stock quote data."""
-        required_fields = ['symbol', 'bid', 'ask']
-        
-        # Check required fields exist
-        if not all(field in data for field in required_fields):
-            return False
-        
-        # Check bid/ask are valid numbers
-        try:
-            bid = float(data['bid']) if data['bid'] is not None else None
-            ask = float(data['ask']) if data['ask'] is not None else None
-            
-            if bid is not None and ask is not None:
-                # Bid should be <= ask
-                if bid > ask:
-                    logger.warning(f"Invalid bid/ask: bid={bid} > ask={ask}")
-                    return False
-                
-                # Bid and ask should be positive
-                if bid < 0 or ask < 0:
-                    logger.warning(f"Negative bid/ask: bid={bid}, ask={ask}")
-                    return False
-                
-                # Spread should be reasonable (< 50% of mid)
-                mid = (bid + ask) / 2
-                spread_pct = (ask - bid) / mid if mid > 0 else float('inf')
-                if spread_pct > 0.5:
-                    logger.warning(f"Wide spread: {spread_pct:.2%}")
-                    return False
-            
-            return True
-            
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Invalid numeric data: {e}")
-            return False
-    
-    @staticmethod
-    def validate_timestamp(timestamp: Union[str, int, float]) -> bool:
-        """Validate timestamp is recent enough."""
-        try:
-            if isinstance(timestamp, str):
-                # Try parsing ISO format
-                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            else:
-                # Assume Unix timestamp
-                dt = datetime.fromtimestamp(float(timestamp))
-            
-            # Check if timestamp is within last 24 hours
-            age = datetime.utcnow() - dt
-            return age < timedelta(hours=24)
-            
-        except (ValueError, OSError):
-            return False
-    
-    @staticmethod
-    def validate_greeks(greeks: Dict) -> bool:
-        """Validate options Greeks are within reasonable ranges."""
-        validations = [
-            ('delta', lambda x: -1 <= x <= 1),
-            ('gamma', lambda x: x >= 0),
-            ('theta', lambda x: x <= 0),  # Theta is typically negative
-            ('vega', lambda x: x >= 0),
-            ('rho', lambda x: True)  # Rho can be positive or negative
-        ]
-        
-        for greek, validator in validations:
-            if greek in greeks and greeks[greek] is not None:
-                try:
-                    value = float(greeks[greek])
-                    if not validator(value):
-                        logger.warning(f"Invalid {greek}: {value}")
-                        return False
-                except (ValueError, TypeError):
-                    logger.warning(f"Invalid {greek} format: {greeks[greek]}")
-                    return False
-        
-        return True
+    def reset_circuit_breaker(self):
+        """Manually reset circuit breaker (for admin use)."""
+        self.circuit_breaker.state = CircuitBreakerState.CLOSED
+        self.circuit_breaker.failure_count = 0
+        self.circuit_breaker.last_failure_time = None
+        self.logger.info(f"Circuit breaker manually reset for {self.get_provider_name()}")

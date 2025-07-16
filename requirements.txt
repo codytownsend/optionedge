@@ -1,35 +1,258 @@
-# Core dependencies
+# Options Trading Engine Dependencies
+# Core dependencies for the options trading engine
+
+# Web and API
 requests>=2.31.0
+urllib3>=1.26.0
+aiohttp>=3.8.0
+
+# Data Processing
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.10.0
-pydantic>=2.0.0
-python-dotenv>=1.0.0
-tenacity>=8.2.0
 
-# API and data sources
-yfinance>=0.2.18
-fredapi>=0.5.0
+# Mathematical and Statistical
+scikit-learn>=1.3.0
+statsmodels>=0.14.0
 
-# Configuration and validation
-pyyaml>=6.0
+# Configuration and Serialization
+pyyaml>=6.0.0
+toml>=0.10.2
 jsonschema>=4.17.0
 
-# Logging and monitoring
+# Database
+psycopg2-binary>=2.9.0
+SQLAlchemy>=2.0.0
+alembic>=1.11.0
+
+# Cache
+redis>=4.5.0
+hiredis>=2.2.0
+
+# Async Support
+asyncio-throttle>=1.0.0
+aioredis>=2.0.0
+
+# Monitoring and Logging
+psutil>=5.9.0
+prometheus-client>=0.16.0
 structlog>=23.1.0
-colorama>=0.4.6
 
-# Testing
+# Financial Data
+yfinance>=0.2.0
+alpha-vantage>=2.3.0
+polygon-api-client>=1.12.0
+
+# Time and Date
+python-dateutil>=2.8.0
+pytz>=2023.3
+
+# HTTP and Security
+certifi>=2023.5.7
+cryptography>=41.0.0
+
+# Development Tools
 pytest>=7.4.0
-pytest-asyncio>=0.21.0
-pytest-mock>=3.11.0
 pytest-cov>=4.1.0
-
-# Development tools
-black>=23.7.0
-flake8>=6.0.0
-mypy>=1.5.0
+pytest-mock>=3.11.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
 isort>=5.12.0
+flake8>=6.0.0
+mypy>=1.4.0
+pre-commit>=3.3.0
 
-# Optional: For advanced calculations
-quantlib>=1.31  # May require additional setup
+# Documentation
+sphinx>=7.0.0
+sphinx-rtd-theme>=1.2.0
+
+# Jupyter (for analysis)
+jupyter>=1.0.0
+jupyterlab>=4.0.0
+notebook>=6.5.0
+
+# Plotting and Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.15.0
+
+# Performance
+numba>=0.57.0
+cython>=0.29.0
+
+# Testing Data
+factory-boy>=3.3.0
+faker>=19.0.0
+
+# Type Hints
+types-requests>=2.31.0
+types-PyYAML>=6.0.0
+types-redis>=4.5.0
+types-python-dateutil>=2.8.0
+
+# Error Handling and Monitoring
+sentry-sdk>=1.28.0
+rollbar>=0.16.0
+
+# Email
+smtplib2>=0.2.0
+
+# Slack Integration
+slack-sdk>=3.21.0
+
+# CLI
+click>=8.1.0
+rich>=13.4.0
+typer>=0.9.0
+
+# File System
+pathlib2>=2.3.0
+watchdog>=3.0.0
+
+# Concurrency
+concurrent-futures>=3.1.0
+threading2>=0.1.0
+
+# Validation
+pydantic>=2.0.0
+marshmallow>=3.20.0
+
+# Utilities
+python-dotenv>=1.0.0
+more-itertools>=10.0.0
+toolz>=0.12.0
+funcy>=2.0.0
+
+# Financial Calculations
+QuantLib-Python>=1.31.0
+py-vollib>=1.0.0
+mibian>=0.1.0
+
+# Market Data
+eikon>=1.1.0
+refinitiv-data>=1.0.0
+
+# Alternative Data
+quandl>=3.7.0
+alpha-vantage>=2.3.0
+iex-api-python>=0.0.4
+
+# Technical Analysis
+ta-lib>=0.4.0
+talib>=0.4.0
+pandas-ta>=0.3.0
+
+# Machine Learning (if needed)
+tensorflow>=2.13.0
+torch>=2.0.0
+xgboost>=1.7.0
+
+# Data Validation
+cerberus>=1.3.0
+voluptuous>=0.13.0
+
+# Caching
+diskcache>=5.6.0
+cachetools>=5.3.0
+
+# Serialization
+pickle5>=0.0.0
+dill>=0.3.0
+cloudpickle>=2.2.0
+
+# Networking
+httpx>=0.24.0
+websockets>=11.0.0
+
+# Compression
+lz4>=4.3.0
+zstandard>=0.21.0
+
+# Profiling
+memory-profiler>=0.60.0
+line-profiler>=4.0.0
+py-spy>=0.3.0
+
+# Security
+keyring>=24.2.0
+cryptography>=41.0.0
+passlib>=1.7.0
+
+# Environment
+environs>=9.5.0
+python-decouple>=3.8.0
+
+# Configuration
+hydra-core>=1.3.0
+omegaconf>=2.3.0
+
+# Scheduling
+schedule>=1.2.0
+apscheduler>=3.10.0
+
+# Process Management
+supervisor>=4.2.0
+gunicorn>=21.0.0
+
+# Health Checks
+healthcheck>=1.3.0
+
+# Performance Monitoring
+py-spy>=0.3.0
+pympler>=0.9.0
+
+# Data Quality
+great-expectations>=0.17.0
+pandera>=0.15.0
+
+# Backtesting
+backtrader>=1.9.0
+zipline>=2.2.0
+bt>=0.2.0
+
+# Risk Management
+empyrical>=0.5.0
+pyfolio>=0.9.0
+
+# Portfolio Optimization
+cvxpy>=1.3.0
+cvxopt>=1.3.0
+
+# Time Series
+arch>=6.2.0
+pmdarima>=2.0.0
+
+# Alerts and Notifications
+twilio>=8.5.0
+pushbullet.py>=0.12.0
+
+# Documentation Generation
+pdoc>=14.0.0
+pydoc-markdown>=4.8.0
+
+# Code Quality
+bandit>=1.7.0
+safety>=2.3.0
+vulture>=2.7.0
+
+# Deployment
+docker>=6.1.0
+kubernetes>=27.2.0
+
+# Data Storage
+h5py>=3.9.0
+tables>=3.8.0
+feather-format>=0.4.0
+
+# Streaming
+kafka-python>=2.0.0
+pika>=1.3.0
+
+# Development
+ipython>=8.14.0
+ipdb>=0.13.0
+pudb>=2022.1.0
+
+# Documentation
+mkdocs>=1.5.0
+mkdocs-material>=9.1.0
